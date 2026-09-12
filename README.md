@@ -49,8 +49,9 @@ io-study/
 │   ├── reactor_server.c      Reactor 模式 echo server（ET + 非阻塞）
 │   ├── echo_epoll.c          epoll echo server，单线程 Reactor（用于 strace / 压测对比）
 │   ├── echo_epoll_mt.c       多线程 Reactor（SO_REUSEPORT 分流，N worker 各自 epoll）
-│   ├── echo_io_uring.c       io_uring echo server（Proactor 版）
-│   ├── bench_client.cpp      多线程 C++ 压测客户端
+│   ├── echo_io_uring.c       io_uring echo server（Proactor 基础版）
+│   ├── echo_io_uring_adv.c   io_uring 火力全开版（SQPOLL/缓冲区环/multishot/ZC）
+│   ├── bench_client.cpp      多线程 C++ 压测客户端（无 GIL）
 │   ├── bench.py              Python 压测客户端（推荐；支持连接数/预热/延迟分位/JSON）
 │   └── strace_epoll实测.txt   epoll 处理 1 条消息的真实系统调用序列
 │
@@ -91,6 +92,7 @@ io-study/
 | `make check` | 环境体检（等价于 `scripts/check_env.sh` 的核心项） |
 | `make bench` | 磁盘 I/O 三方对比 |
 | `make bench_demo` | epoll O_NONBLOCK 对比实验 |
+| `make net` | 编译网络部分（含 `echo_io_uring_adv`） |
 | `make bench_net` | 网络 echo 对比（epoll vs io_uring，单场景） |
 | `make bench_disk_matrix` | 磁盘 I/O 多维度对比（队列深度 × 块大小 × O_DIRECT），产出 `results/*.md` + `.csv` |
 | `make bench_net_matrix` | 网络 I/O 多维度对比（服务端 × 连接数 × 消息大小 × TCP_NODELAY），产出 `results/*.md` + `.csv` |
@@ -140,7 +142,7 @@ sudo yum install -y gcc gcc-c++ make libaio-devel liburing-devel strace
 
 ---
 
-## 四组实验分别回答什么
+## 五组实验分别回答什么
 
 ### 实验一：磁盘 I/O（sync vs libaio vs io_uring）
 
@@ -328,6 +330,52 @@ python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 | **io-wq 代价** | io_uring 在无法就地完成时会 punt 给内核工作线程池（`iou-wrk-*`），小 I/O 场景下这笔跨线程开销可能吃光收益 |
 | **O_DIRECT** | 绕过 page cache，需 512 字节对齐，是测真实磁盘能力的前提 |
 | **协程** | 把 epoll 藏在同步系统调用后面（hook + yield/resume），切换仅 ~15 ns |
+
+---
+
+## 实验五：io_uring 的极限在哪（`echo_io_uring_adv`）
+
+基础版 io_uring（`echo_io_uring.c`）每条消息提交一次 SQE、立刻 `io_uring_enter` 一次，
+把 io_uring 最值钱的特性全浪费了，结果反而略慢于 epoll。`network/echo_io_uring_adv.c`
+把四个高级特性都实现出来，**并且每个都能用环境变量独立开关**，这样可以量化各自贡献：
+
+| 特性 | 作用 | 内核要求 | 本机(Ubuntu 22.04 / 5.15) |
+| --- | --- | --- | --- |
+| `IORING_SETUP_SQPOLL` | 内核线程轮询 SQ，**提交不进内核** | ≥5.1（非特权需 ≥5.13） | ✅ 可用 |
+| 提供缓冲区环 `IORING_REGISTER_PBUF_RING` | 缓冲区交给内核自取，内存 O(连接数)→O(缓冲数) | ≥5.19 | ❌ 不可用 |
+| `IORING_RECV_MULTISHOT` | 提交一次 recv 持续收割（**注意：是 flag 不是 opcode**） | ≥5.19 | ❌ 不可用 |
+| `IORING_OP_SEND_ZC` | 零拷贝发送（会返回两个 CQE，要等 `IORING_CQE_F_NOTIF`） | ≥6.0 | ❌ 不可用 |
+
+```bash
+make net
+ECHO_SQPOLL=1 ./bin/echo_io_uring_adv 19002      # 启动时会打印「能力自检」表
+ECHO_SPIN=1   ./bin/echo_io_uring_adv 19002      # 再加 CQ 忙轮询
+```
+
+**实测一组**（16 客户端线程 × 256B，客户端绑核 0-3、服务端绑核 4）：
+
+| 服务端 | QPS | 相对 epoll |
+| --- | --- | --- |
+| epoll 单线程 | 118,841 | 1.00x |
+| io_uring 基础版 | 89,071 | 0.75x |
+| adv `SQPOLL=0` | 52,175 | 0.44x |
+| adv `SQPOLL=1` | **117,395** | 0.99x |
+| adv `SQPOLL=1` + CQ 忙轮询 | **149,313** | **1.26x** |
+| adv `SQPOLL=1` + CQ 忙轮询 + 4 核 | 150,989 | 1.27x |
+
+三条结论：
+
+1. **SQPOLL 是决定性的**：同一个二进制，`SQPOLL=0 → 1` 从 52k 涨到 117k，**2.25x**。
+   这就是「提交不进内核」的价值。
+2. **CQ 忙轮询只在 SQPOLL 之上才有意义**：`SQPOLL=1` 时再 +27%（117k→149k）；
+   而 `SQPOLL=0` 时忙轮询毫无作用（52.2k vs 51.6k）—— 因为提交那一次系统调用还在，
+   只省收割没意义。**这直接回答了「什么时候 io_uring 才有优势」：当你能把
+   「提交」和「收割」的系统调用都消掉时。**
+3. **这是本项目里 io_uring 第一次超过 epoll**（149k vs 119k，1.26x）—— 而且才用了一个核。
+
+> ⚠️ 想真正跑 multishot recv / 提供缓冲区环 / zerocopy send，需要**内核 ≥6.0**。
+> Ubuntu 22.04 可装 HWE 内核（`linux-generic-hwe-22.04`，6.8）来解锁。
+> 代码里这些特性都写好了并且会在内核不支持时**自动降级**，只要内核升级就能直接用。
 
 ---
 

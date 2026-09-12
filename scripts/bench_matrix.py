@@ -612,6 +612,36 @@ def derive_net_insights(samples: Sequence[Sample], args) -> list[str]:
         out.append("维度 A 峰值：**%s** 在 %d 连接时达到 %s QPS。"
                    % (peak.impl, peak.x, fmt_count(peak.metrics["qps"])))
 
+    # ---- 自洽性检查：用 Little's law 反推平均延迟，和实测分位对照 ----
+    #
+    # 每条连接始终有 1 个在途请求，所以在途请求数 ≈ 连接数，于是：
+    #     平均延迟 ≈ 连接数 / QPS
+    # 如果这个「反推的平均延迟」比实测 p99 还大好几倍，说明**测量本身不自洽**：
+    # 要么在途请求数根本没到连接数（服务端没在真正服务所有连接），
+    # 要么客户端统计到的"响应"并不对应它刚发出的请求。
+    # 这种数据不能拿来下结论 —— 我第一次看 libco 的 p99 时就被坑过。
+    suspicious = []
+    for s in samples:
+        if s.dim != "A":
+            continue
+        qps = s.metrics.get("qps", 0)
+        p99 = s.metrics.get("p99_us", 0)
+        if qps <= 0 or p99 <= 0:
+            continue
+        avg_us = s.x / qps * 1e6  # 连接数 / QPS → 反推的平均延迟(µs)
+        if avg_us > 3 * p99:
+            suspicious.append((s, avg_us, p99))
+
+    if suspicious:
+        s, avg_us, p99 = suspicious[0]
+        out.append("⚠️ **自洽性检查未通过**：`%s` 在 %d 连接时 %s QPS，按 Little's law "
+                   "反推平均延迟 ≈ **%.0f µs**，却测出 p99 = %d µs（差了 %.0f 倍）。"
+                   "这说明**在途请求数没有达到 %d 条** —— 该行的延迟数字不可信。"
+                   "请确认服务端真能并发处理这么多连接（例如 libco 示例的协程池大小、"
+                   "epoll 的 listen backlog），或先用更少的连接数复测。"
+                   % (s.impl, s.x, fmt_count(s.metrics.get("qps", 0)),
+                      avg_us, p99, avg_us / p99, s.x))
+
     # 多线程 Reactor vs 单线程
     xs = sorted({s.x for s in samples if s.dim == "A" and s.impl == "epoll"
                  and s.metrics.get("qps", 0)})

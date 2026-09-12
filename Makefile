@@ -65,7 +65,7 @@ LIBCO_SRC?= $(TPDIR)/libco
 DISK_TARGETS := $(BINDIR)/io_sync $(BINDIR)/io_libaio $(BINDIR)/io_uring_disk
 EPOLL_DEMOS  := $(BINDIR)/epoll_nonblock_demo $(BINDIR)/epoll_starve_demo
 NET_TARGETS  := $(BINDIR)/echo_epoll $(BINDIR)/echo_epoll_mt $(BINDIR)/echo_io_uring \
-                $(BINDIR)/reactor_server $(BINDIR)/bench_client
+                $(BINDIR)/echo_io_uring_adv $(BINDIR)/reactor_server $(BINDIR)/bench_client
 
 .PHONY: all disk net demos libco bench bench_demo bench_net bench_net_matrix \
         bench_disk_matrix check clean help
@@ -78,7 +78,7 @@ help:
 	@echo "  构建："
 	@echo "    make            编译全部"
 	@echo "    make disk       只编译磁盘 I/O 三版 (sync / libaio / io_uring)"
-	@echo "    make net        只编译网络 (echo_epoll / echo_epoll_mt / echo_io_uring / reactor_server / bench_client)"
+	@echo "    make net        只编译网络 (echo_epoll / echo_epoll_mt / echo_io_uring[_adv] / reactor_server / bench_client)"
 	@echo "    make demos      只编译 epoll O_NONBLOCK 验证 demo"
 	@echo "    make libco      编译 libco 与协程 bench（需先 clone 到 third_party/libco）"
 	@echo ""
@@ -135,6 +135,12 @@ $(BINDIR)/echo_epoll: $(NETDIR)/echo_epoll.c | $(BINDIR)
 $(BINDIR)/echo_epoll_mt: $(NETDIR)/echo_epoll_mt.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(NET_LIBS)
 	@echo "  [OK] echo_epoll_mt"
+
+# io_uring 火力全开版：SQPOLL + 提供缓冲区环 + multishot recv + zerocopy send
+# 各特性可用环境变量独立开关（见文件头注释），并会在启动时打印能力自检表
+$(BINDIR)/echo_io_uring_adv: $(NETDIR)/echo_io_uring_adv.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)
+	@echo "  [OK] echo_io_uring_adv"
 
 $(BINDIR)/echo_io_uring: $(NETDIR)/echo_io_uring.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)
