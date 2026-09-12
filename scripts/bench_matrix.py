@@ -77,6 +77,190 @@ class Tee:
         self.file.close()
 
 
+# ---------------------------------------------------------------------------
+# 测量介质：先确认「你测的到底是什么」
+#
+# 这一节是被一次真实的翻车逼出来的：
+#   * 两台 VM 共用同一个 sshfs 挂载目录，bin/ 会互相覆盖 ——
+#     后编的那台（Ubuntu 26.04）把先编的那台（22.04）的可执行文件盖掉了，
+#     结果在 22.04 上跑出「找不到 libaio.so.1t64」。
+#   * 磁盘矩阵的默认测试文件是 /tmp/iodemo_matrix。在 22.04 上 /tmp 属于根
+#     文件系统（真盘），在 26.04 上 /tmp 却是 **tmpfs（内存盘）** ——
+#     同一套命令，跑出 163 万 IOPS，测的其实是内存。
+#   * 如果把测试文件放到 sshfs（FUSE over SFTP，本质是网络文件系统）上，
+#     「异步靠深度换吞吐」这个结论会**完全反过来**：实测 libaio 只有同步的 0.61x。
+#     更阴的是 O_DIRECT 在 sshfs 上**打开成功但被忽略**，看不出任何异常。
+#
+# 所以：跑之前先认介质，不匹配就拒绝跑，而不是默默给出好看的错数字。
+# ---------------------------------------------------------------------------
+
+def build_stamp_text() -> str:
+    """当前机器/内核/架构，与 Makefile 写进 bin/.build-stamp 的格式一致。"""
+    import platform
+
+    def _run(cmd: str, default: str) -> str:
+        try:
+            return subprocess.run(cmd, shell=True, capture_output=True,
+                                  text=True, timeout=5).stdout.strip() or default
+        except Exception:
+            return default
+
+    return "|".join([_run("hostname", "?"), platform.release(), platform.machine()])
+
+
+def check_build_stamp(ignore: bool, log=None) -> list[str]:
+    """核对 bin/ 里的产物是不是**本机**编的。返回警告文本列表。"""
+    stamp_file = BIN / ".build-stamp"
+    if not stamp_file.exists():
+        return []          # 没有戳（老版本编的），不做判断
+    parts = stamp_file.read_text(encoding="utf-8").strip().split("|")
+    if len(parts) < 3:
+        return []
+    built_on, built_kernel, built_arch, *rest = parts
+    built_at = rest[0] if rest else "?"
+    now_host, now_kernel, now_arch = build_stamp_text().split("|")
+    if built_on == now_host and built_kernel == now_kernel and built_arch == now_arch:
+        return []
+    msg = [
+        "⚠️  bin/ 里的可执行文件不是本机编译的！",
+        "     编译于: %s / 内核 %s / %s / %s" % (built_on, built_kernel, built_arch, built_at),
+        "     当前机: %s / 内核 %s / %s" % (now_host, now_kernel, now_arch),
+        "     如果两台机器共用同一个挂载目录，bin/ 会被互相覆盖，",
+        "     跑出来的动态库/ABI 都可能对不上（曾出现「找不到 libaio.so.1t64」）。",
+        "     请先在本机执行： make disk  或  make net",
+    ]
+    for line in msg:
+        print(line)
+    if log:
+        for line in msg:
+            log.write(line)
+    return msg
+
+
+MEDIUM_KIND_CN = {"local": "本地块设备（可作基准）",
+                  "memory": "内存盘（数字无效！）",
+                  "remote": "网络/远程文件系统（异步结论会失效！）",
+                  "unknown": "未知"}
+
+MEDIUM_MEMORY = ("tmpfs", "ramfs", "devtmpfs")
+MEDIUM_REMOTE = ("fuse", "fuse.sshfs", "nfs", "nfs4", "cifs", "smb", "9p", "virtiofs")
+
+
+def _probe_medium_macos(path: str, parent: str) -> dict:
+    """macOS 分支：没有 findmnt，也没有 df -T，只能解析 mount 的输出。
+
+    macOS 的 mount 行格式：
+        /dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, ...)
+        map -hosts on /net (autofs, nosuid, automounted, nobrowse)
+    取「挂载点是最长前缀」的那一条，选项里的 local/network 就是我们要的判据。
+    """
+    fstype, source, kind = "unknown", "?", "unknown"
+    try:
+        out = subprocess.run(["mount"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    best = None
+    for line in out.splitlines():
+        m = re.match(r"(\S+) on (.*?) \(([^)]*)\)", line)
+        if not m:
+            continue
+        src, mnt, opts = m.groups()
+        if parent == mnt or mnt == "/" or parent.startswith(mnt.rstrip("/") + "/"):
+            if best is None or len(mnt) > len(best[1]):
+                best = (src, mnt, opts)
+    if best:
+        src, _mnt, opts = best
+        flags = [o.strip() for o in opts.split(",")]
+        fstype = opts.split(",")[0].strip()
+        source = src
+        if "network" in flags or fstype in ("nfs", "smbfs", "webdav", "afpfs", "acfs"):
+            kind = "remote"
+        elif fstype in ("tmpfs", "devfs"):
+            kind = "memory"
+        else:
+            kind = "local"
+    return {"fstype": fstype, "source": source, "kind": kind, "path": path}
+
+
+def probe_medium(path: str) -> dict:
+    """看一眼某个路径落在什么介质上。"""
+    parent = str(Path(path).expanduser().parent)
+    fstype, source = "unknown", "?"
+
+    if sys.platform == "darwin":
+        return _probe_medium_macos(path, parent)
+
+    # 首选 findmnt（能直接给出 FSTYPE + SOURCE，且对 FUSE 也有效）
+    try:
+        out = subprocess.run(["findmnt", "-no", "FSTYPE,SOURCE", "-T", parent],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        if out:
+            bits = out.split()
+            fstype = bits[0]
+            source = bits[1] if len(bits) > 1 else "?"
+    except Exception:
+        pass
+
+    if fstype == "unknown":
+        # 退路：df -T（注意：对 sshfs 会报 Operation not supported）
+        try:
+            out = subprocess.run(["df", "-T", parent], capture_output=True,
+                                 text=True, timeout=10).stdout
+            bits = out.splitlines()[1].split()
+            fstype = bits[1]
+            source = bits[0]
+        except Exception:
+            pass
+
+    low = fstype.lower()
+    if low in MEDIUM_MEMORY:
+        kind = "memory"
+    elif any(k in low for k in MEDIUM_REMOTE):
+        kind = "remote"
+    elif low == "unknown":
+        kind = "unknown"
+    else:
+        kind = "local"
+    return {"fstype": fstype, "source": source, "kind": kind, "path": path}
+
+
+def medium_warnings(m: dict) -> list[str]:
+    """返回这个介质会不会让结论失效的说明。"""
+    out = []
+    if m["kind"] == "memory":
+        out += [
+            "⚠️  介质是 %s（内存盘）—— 测出来的不是磁盘！" % m["fstype"],
+            "     O_DIRECT 在 tmpfs 上会被拒绝（5.15）或被静默忽略（7.0），",
+            "     同步写实测能跑到 160 万 IOPS，那是内存的速度。",
+            "     请用 --file 指到真实磁盘上（例如 /var/tmp 或 $HOME 下的路径）。",
+        ]
+    elif m["kind"] == "remote":
+        out += [
+            "⚠️  介质是 %s（网络/远程文件系统）—— 异步 I/O 的结论在这里会失效！" % m["fstype"],
+            "     实测（同一台 VM、同一份代码、同一组参数）：",
+            "       VM 本地盘：同步 8.2k / libaio 195k  →  异步是同步的 23.8x",
+            "       sshfs    ：同步 5.0k / libaio 3.0k  →  异步只有同步的 0.61x",
+            "     更阴的是 O_DIRECT 在这里**打开成功但被忽略**，没有任何报错。",
+            "     请用 --file 指到真实本地磁盘，否则「深度换吞吐」会被测反。",
+        ]
+    return out
+
+
+def pick_disk_file() -> str:
+    """挑一个落在真实块设备上的默认测试文件路径。"""
+    candidates = ["/var/tmp", "/tmp", os.path.expanduser("~"), str(ROOT)]
+    fallback = None
+    for d in candidates:
+        if not os.path.isdir(d):
+            continue
+        m = probe_medium(os.path.join(d, "probe"))
+        if m["kind"] == "local":
+            return os.path.join(d, "iodemo_matrix")
+        if fallback is None:
+            fallback = os.path.join(d, "iodemo_matrix")
+    return fallback or "/tmp/iodemo_matrix"
+
+
 def first_existing(*paths: Path) -> Path | None:
     """返回第一个存在的路径。
 
@@ -774,25 +958,20 @@ def run_disk(args) -> int:
     csv_path = RESULTS / (tag + ".csv")
     log = Tee(RESULTS / (tag + ".log"))
 
-    fstype = "unknown"
-    try:
-        out = subprocess.run(["df", "-T", str(Path(args.file).parent)],
-                             capture_output=True, text=True, timeout=10).stdout
-        parts = out.splitlines()[1].split()
-        fstype = parts[1]
-    except Exception:
-        pass
+    medium = probe_medium(args.file)
+    warn = medium_warnings(medium)
 
     log.write("=" * 60)
     log.write("  磁盘 I/O 多维度对比压测")
     log.write("  模式=%s  每点目标 I/O 量=%d MB  文件=%s"
               % (args.mode, args.bytes // 1024 // 1024, args.file))
-    log.write("  文件系统: %s" % fstype)
+    log.write("  ★ 测量介质: %s（挂载源 %s）—— %s"
+              % (medium["fstype"], medium["source"], MEDIUM_KIND_CN[medium["kind"]]))
     log.write("=" * 60)
-    if fstype in ("tmpfs", "ramfs"):
-        log.write("[警告] 该路径是 %s，不支持 O_DIRECT，DIRECT=1 的测点会失败。" % fstype)
-        log.write("       请用 --file 指定真实磁盘上的路径。")
-    log.write("")
+    for w in warn:
+        log.write(w)
+    if warn:
+        log.write("")
 
     samples: list[Sample] = []
 
@@ -990,8 +1169,11 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--mode", choices=["quick", "full"], default="quick")
     d.add_argument("--bytes", type=int, default=0,
                    help="每个测点的目标 I/O 字节数（默认 quick=64MB, full=256MB）")
-    d.add_argument("--file", default="/tmp/iodemo_matrix",
-                   help="测试文件路径，必须落在真实文件系统上（tmpfs 不支持 O_DIRECT）")
+    d.add_argument("--file", default=None,
+                   help="测试文件路径。默认自动挑一个落在真实块设备上的路径"
+                        "（避开 tmpfs 内存盘与 sshfs 这类网络文件系统）")
+    d.add_argument("--ignore-bin-stamp", action="store_true",
+                   help="跳过 bin/ 构建戳校验（不推荐；共用挂载目录时极易测错）")
     d.add_argument("--sync-divisor", type=int, default=8,
                    help="同步方式的 I/O 次数 = 异步 / 该系数")
     d.add_argument("--timeout", type=int, default=180, help="单个测点超时（秒）")
@@ -1004,6 +1186,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
+    # 先确认 bin/ 里的东西是不是本机编的（多机共用挂载目录时会互相覆盖）
+    stamped = check_build_stamp(args.ignore_bin_stamp)
+    if stamped and not args.ignore_bin_stamp:
+        print("  想强行继续：加 --ignore-bin-stamp（但结果可能是别台机器的产物）")
+        return 2
+
     if args.target == "net":
         for binary in ("echo_epoll", "echo_epoll_mt", "echo_io_uring"):
             if not (BIN / binary).exists():
@@ -1012,6 +1200,8 @@ def main() -> int:
 
     if args.bytes == 0:
         args.bytes = 67108864 if args.mode == "quick" else 268435456
+    if not args.file:
+        args.file = pick_disk_file()
     for binary in ("io_sync", "io_libaio", "io_uring_disk"):
         if not (BIN / binary).exists():
             print("[提示] 缺少 bin/%s，请先 make disk" % binary)

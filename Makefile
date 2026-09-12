@@ -39,6 +39,27 @@ LIBAIO_LIB := -laio
 URING_LIB  := -luring
 NET_LIBS   := -lpthread -ldl
 
+# ---- 平台检测 ----
+# 本项目的核心实现（epoll / io_uring / libaio）都是 **Linux 专有** 的：
+# macOS 上既没有 <sys/epoll.h>，也没有 io_uring / libaio 这两套内核接口。
+# 所以 macOS 侧单独提供了一组「对等物」实现：
+#     network/echo_kqueue.c   kqueue 版 Reactor echo server（≈ echo_epoll.c）
+#     disk/io_macos.c         F_NOCACHE + 多线程模拟并发深度（≈ io_sync / io_libaio）
+# 压测客户端（network/bench.py、network/bench_client.cpp）两边通用，无需改动。
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+  CC         := cc
+  CXX        := c++
+  CFLAGS     := -O2 -Wall -Wextra
+  CXXFLAGS   := -O2 -Wall -Wextra -std=c++17
+  NET_LIBS   := -lpthread
+  LIBAIO_LIB :=
+  URING_LIB  :=
+  # 注意用 =（递归展开）而不是 := —— BINDIR 在下面才定义，:= 会立刻展开成空
+  MAC_TARGETS = $(BINDIR)/echo_kqueue $(BINDIR)/io_macos $(BINDIR)/bench_client
+endif
+
 # ---- 参数 ----
 FILE    ?= /tmp/iodemo_testfile
 BLOCK   ?= 4096
@@ -74,6 +95,11 @@ NET_TARGETS  := $(BINDIR)/echo_epoll $(BINDIR)/echo_epoll_mt $(BINDIR)/echo_io_u
 #   direct accept / 稀疏固定文件表 / 批量取 CQE（liburing ≥ 2.6）
 # 老发行版（例如 Ubuntu 22.04 自带的 2.1）没有这些符号，硬编会**整个构建失败**。
 # 所以这里在解析阶段探一下头文件，缺符号就把它从目标列表里摘掉，并给出提示。
+# io_uring_sqe_set_data64() 是 liburing 2.2 才加入的（Ubuntu 22.04 自带的 2.1 没有）。
+# 探测一下，让 examples/io_uring_echo.c 自动走对分支。
+URING_DATA64 := $(shell \
+  grep -q io_uring_sqe_set_data64 /usr/include/liburing.h 2>/dev/null && echo yes || echo no)
+
 URING_MODERN_OK := $(shell \
   grep -q io_uring_prep_multishot_accept_direct /usr/include/liburing.h 2>/dev/null && \
   grep -q io_uring_register_files_sparse          /usr/include/liburing.h 2>/dev/null && \
@@ -84,8 +110,21 @@ ifeq ($(URING_MODERN_OK),yes)
 NET_TARGETS += $(BINDIR)/echo_io_uring_modern
 endif
 
+# ---- macOS：清空 Linux 专有目标列表 ----
+# epoll / io_uring / libaio 都是 Linux 内核接口，macOS 上连头文件都没有。
+# 这里把目标列表清空，规则本身保留（Linux 上照常工作），
+# 于是 make disk / net / demos / examples 在 macOS 上不会去编译注定失败的文件。
+# 另外把 URING_MODERN_OK 置为 yes，避免 net 目标里那段「跳过提示」被当成 recipe。
+ifeq ($(UNAME_S),Darwin)
+  DISK_TARGETS    :=
+  EPOLL_DEMOS     :=
+  EXAMPLES        :=
+  NET_TARGETS     :=
+  URING_MODERN_OK := yes
+endif
+
 .PHONY: all disk net demos examples libco bench bench_demo bench_net bench_net_matrix \
-        bench_disk_matrix check clean help
+        bench_disk_matrix macos check clean help FORCE
 
 all: disk net demos
 
@@ -99,6 +138,9 @@ help:
 	@echo "                    _modern 需要 liburing >= 2.6，老环境会自动跳过并提示"
 	@echo "    make demos      只编译 epoll O_NONBLOCK 验证 demo"
 	@echo "    make examples   只编译 docs/md/04~06 三篇编程指南的配套示例"
+	@if [ "$(UNAME_S)" = "Darwin" ]; then \
+	  echo "    make macos      编译 macOS 对等实现 (echo_kqueue / io_macos / bench_client)"; \
+	fi
 	@echo "    make libco      编译 libco 与协程 bench（需先 clone 到 third_party/libco）"
 	@echo ""
 	@echo "  运行："
@@ -341,7 +383,7 @@ $(BINDIR)/ex_epoll_echo: $(EXDIR)/epoll_echo.c | $(BINDIR)
 	@echo "  [OK] ex_epoll_echo"
 
 $(BINDIR)/ex_io_uring_echo: $(EXDIR)/io_uring_echo.c | $(BINDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)
+	$(CC) $(CFLAGS) $(if $(filter yes,$(URING_DATA64)),-DHAVE_SQE_DATA64=1,) -o $@ $< $(URING_LIB)
 	@echo "  [OK] ex_io_uring_echo"
 
 $(BINDIR)/ex_libaio_rw: $(EXDIR)/libaio_rw.c | $(BINDIR)
@@ -353,3 +395,52 @@ clean:
 	@rm -rf $(BINDIR)
 	@rm -f $(FILE)
 	@echo "已清理 bin/ 与 $(FILE)"
+
+# ================= 构建戳（防止多台机器共用一份挂载目录时互相覆盖）=================
+#
+# 背景：工作区通过 sshfs 挂载进虚拟机时，bin/ 是**所有虚拟机共享**的。
+# 两台机器（比如 Ubuntu 22.04 与 26.04）各自 make 一次就会互相覆盖对方编出来的
+# 可执行文件 —— 后编的那台的动态库依赖（glibc/libaio 版本）会让先编的那台跑不起来。
+# 这个戳记下「bin/ 里的产物是哪台机器、哪个内核、什么时候编的」，
+# scripts/bench_matrix.py 会在压测前核对它，不匹配就拒绝跑（而非默默测错东西）。
+$(BINDIR)/.build-stamp: FORCE | $(BINDIR)
+	@printf '%s|%s|%s|%s\n' "$$(hostname)" "$$(uname -r)" "$$(uname -m)" "$$(date '+%F %T')" > $@
+
+FORCE:
+
+all disk net demos examples: $(BINDIR)/.build-stamp
+
+# ================= macOS 平台段 =================
+#
+# 关键：下面只给 Linux 专有目标**加一句提示**，不重定义它们的 recipe ——
+# 两个 recipe 定义同一个目标会让 make 报 "overriding commands for target ..." 警告。
+# 只加前置依赖（prerequisite）是合法的，会与原 recipe 合并。
+ifeq ($(UNAME_S),Darwin)
+
+linux-guard:
+	@echo "  ───────────────────────────────────────────────────────────────"
+	@echo "  [跳过] 该目标依赖 Linux 专有的 epoll / io_uring / libaio，macOS 上"
+	@echo "         没有对应的内核接口，无法编译也无法运行。"
+	@echo "         macOS 请用：make macos"
+	@echo "         对等实现：network/echo_kqueue.c（kqueue）、disk/io_macos.c（F_NOCACHE）"
+	@echo "  ───────────────────────────────────────────────────────────────"
+
+disk net demos examples libco: linux-guard
+bench bench_demo bench_net bench_net_matrix bench_disk_matrix: linux-guard
+
+# ---- macOS 上真正能编的东西 ----
+#   echo_kqueue   kqueue 版单线程 Reactor echo server  （Linux 上对应 echo_epoll.c）
+#   io_macos      F_NOCACHE + 多线程模拟并发深度        （Linux 上对应 io_sync.c / io_libaio.c）
+#   bench_client  纯 POSIX socket，两个平台通用（规则在上面的网络段里，这里不重定义）
+macos: $(BINDIR)/.build-stamp
+macos: | $(BINDIR) $(MAC_TARGETS)
+
+$(BINDIR)/echo_kqueue: $(NETDIR)/echo_kqueue.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo "  [OK] echo_kqueue   （kqueue，对应 Linux 的 echo_epoll）"
+
+$(BINDIR)/io_macos: $(DISKDIR)/io_macos.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+	@echo "  [OK] io_macos      （F_NOCACHE，对应 Linux 的 io_sync / io_libaio）"
+
+endif

@@ -181,6 +181,10 @@ io_uring_prep_timeout(sqe, &ts, 0, 0);
 io_uring_prep_poll_add(sqe, fd, POLLIN);
 io_uring_prep_cancel64(sqe, target_user_data, 0);
 io_uring_sqe_set_data64(sqe, ud);        /* 或者 io_uring_sqe_set_data(sqe, ptr) */
+/* ⚠️ io_uring_sqe_set_data64() 是 liburing 2.2 才有的。
+   Ubuntu 22.04 自带的 2.1 没有它 —— 编译会报 implicit declaration 然后链接失败。
+   老版本请用 io_uring_sqe_set_data(sqe, (void *)(uintptr_t)ud)（64 位平台上等价）。
+   本仓库的 examples/io_uring_echo.c 就是这么做兼容的（Makefile 自动探测）。*/
 ```
 
 **取 SQE 时环可能是满的**（SQ 环只有 entries 个槽位）：

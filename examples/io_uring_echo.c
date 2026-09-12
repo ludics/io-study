@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <liburing.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,12 +64,28 @@ static struct io_uring_sqe *new_sqe(void) {
     return sqe;
 }
 
+// 往 SQE 里塞 user_data 的兼容封装。
+//
+// 为什么需要它：`io_uring_sqe_set_data64()` 是 **liburing 2.2** 才加入的 API，
+// Ubuntu 22.04 自带的 2.1 没有（编译会报 implicit declaration，然后链接失败）。
+// 老版本只能用指针版 `io_uring_sqe_set_data()`；在 64 位平台上把整数塞进指针
+// 是等价的，所以这里封装一层：
+//   * 经 Makefile 编译时会自动探测头文件，命中就加 -DHAVE_SQE_DATA64=1；
+//   * 单独 gcc 编译时没有这个宏，自动退回指针版，一样能跑。
+static inline void ud_set(struct io_uring_sqe *sqe, unsigned long v) {
+#if defined(HAVE_SQE_DATA64)
+    io_uring_sqe_set_data64(sqe, v);
+#else
+    io_uring_sqe_set_data(sqe, (void *)(uintptr_t)v);
+#endif
+}
+
 static void arm_accept(void) {
     struct io_uring_sqe *sqe = new_sqe();
     if (!sqe) return;
     // 传 NULL 拿不到对端地址，但换来省一次内存写；要地址就传 &addr/&len
     io_uring_prep_accept(sqe, g_lfd, NULL, NULL, 0);
-    io_uring_sqe_set_data64(sqe, pack(OP_ACCEPT, 0, 0, 0));
+    ud_set(sqe, pack(OP_ACCEPT, 0, 0, 0));
 }
 
 static void arm_recv(int fd) {
@@ -76,7 +93,7 @@ static void arm_recv(int fd) {
     if (!sqe) return;
     // 注意是 recv 而不是 read：对 socket 语义更明确
     io_uring_prep_recv(sqe, fd, buf_of(fd), BUF_SZ, 0);
-    io_uring_sqe_set_data64(sqe, pack(OP_RECV, fd, 0, 0));
+    ud_set(sqe, pack(OP_RECV, fd, 0, 0));
 }
 
 // 发这条消息的 [off, off+len) 这一段。off 非 0 说明是「部分写」剩下的尾巴。
@@ -84,7 +101,7 @@ static void arm_send(int fd, unsigned off, unsigned len) {
     struct io_uring_sqe *sqe = new_sqe();
     if (!sqe) return;
     io_uring_prep_send(sqe, fd, buf_of(fd) + off, len, MSG_NOSIGNAL);
-    io_uring_sqe_set_data64(sqe, pack(OP_SEND, fd, off, len));
+    ud_set(sqe, pack(OP_SEND, fd, off, len));
 }
 
 int main(int argc, char **argv) {

@@ -2,6 +2,9 @@
 
 从 `select/poll/epoll` 到 `io_uring`，从 Reactor 到 Proactor，从事件回调到协程 —— 一个**能编译、能跑、能压测**的完整实验集合。
 
+> Linux 上是 epoll / io_uring / libaio 三套实现；macOS 上另有一组**对等实现**
+> （`kqueue` 版 echo server、`F_NOCACHE` 版磁盘基准），压测客户端两边通用 → 见 [macOS 上怎么用](#macos-上怎么用)。
+
 所有代码均经过实际编译运行验证，文中所有性能数据都来自真实测量，而非臆测。
 
 > **关于路径**：项目内所有 Makefile 与 Shell 脚本都使用**相对路径**（基于脚本/文件自身位置推导），
@@ -29,7 +32,17 @@ make bench_net_matrix        # ⑦ 网络 I/O 多维度对比（连接数/消息
 bash scripts/run_all_bench.sh        # 跑全部实验，结果存到 results/
 ```
 
+**在 macOS 上**（Linux 专有接口不存在，会自动跳过并给出提示）：
+
+```bash
+make macos                   # 编译 kqueue 版 echo + F_NOCACHE 磁盘基准 + 压测客户端
+./bin/echo_kqueue 19000 &    # kqueue 版服务端
+./bin/bench_client 19000 8 256
+./bin/io_macos /tmp/t.dat 4096 8192 1 1 256
+```
+
 详细的分步说明与预期结果，见 **[Instruction.md](./Instruction.md)**（服务器分步运行指引）。
+**先确认"你测的是什么介质"** —— 见 **[测量环境与复现.md](./docs/测量环境与复现.md)**。
 
 ---
 
@@ -44,6 +57,7 @@ io-study/
 ├── docs/
 │   ├── html/             三份分析文档（HTML 版，浏览器打开，含图表）
 │   ├── md/               分析文档 + 三篇编程指南 + 结论总结（Markdown 版）
+│   ├── 测量环境与复现.md  每个数字测在什么介质上 + macOS 能测什么（重要，先读这份）
 │   └── 挂载方案对比.md    sshfs（multipass 默认）vs virtiofs 的实测对比与规避办法
 │
 ├── examples/             教学示例（与 docs/md/04~06 三篇编程指南配套，make examples）
@@ -58,6 +72,7 @@ io-study/
 │   ├── echo_io_uring.c       io_uring echo server（Proactor 基础版）
 │   ├── echo_io_uring_adv.c   io_uring 火力全开版（SQPOLL/缓冲区环/multishot/ZC）
 │   ├── echo_io_uring_modern.c io_uring 现代版（新内核专用写法，无兼容包袱，最快）
+│   ├── echo_kqueue.c         macOS 对等实现：kqueue 版 Reactor echo server
 │   ├── bench_client.cpp      多线程 C++ 压测客户端（无 GIL）
 │   ├── bench.py              Python 压测客户端（推荐；支持连接数/预热/延迟分位/JSON）
 │   └── strace_epoll实测.txt   epoll 处理 1 条消息的真实系统调用序列
@@ -67,6 +82,7 @@ io-study/
 │   ├── io_sync.c             同步 pread/pwrite 基线
 │   ├── io_libaio.c           libaio 版本（io_setup/io_submit/io_getevents）
 │   ├── io_uring_disk.c       io_uring 版本（SQ/CQ 环形队列）
+│   ├── io_macos.c            macOS 对等实现：F_NOCACHE + 多线程模拟并发深度
 │   ├── epoll_nonblock_demo.c 实验1：单连接 ET+阻塞 vs ET+非阻塞
 │   └── epoll_starve_demo.c   实验2：双连接，证明阻塞 fd 饿死其他连接
 │
@@ -126,6 +142,34 @@ make bench_net_matrix MODE=full        # quick（默认）| full
 | `SIZE` | 单条消息字节数 | 256 |
 | `SECS` | 压测时长（秒） | 5 |
 | `MODE` | `bench_net_matrix` 模式（quick / full） | quick |
+
+---
+
+## macOS 上怎么用
+
+本项目的核心实现都是 **Linux 专有接口**（`epoll` / `io_uring` / `libaio` / `O_DIRECT`），
+在 macOS 上**连头文件都找不到**，编不过也跑不了。所以 macOS 侧单独给了一组**对等实现**：
+
+| macOS 实现 | 对应 Linux 的 | 用什么替代 |
+| --- | --- | --- |
+| `network/echo_kqueue.c` | `network/echo_epoll.c` | `kqueue`（含 `EV_CLEAR` = 边缘触发） |
+| `disk/io_macos.c` | `disk/io_sync.c` / `io_libaio.c` | `fcntl(F_NOCACHE)` + 多线程模拟并发深度 |
+| `network/bench_client.cpp` | 同一个文件 | 只用 POSIX socket，**两个平台通用** |
+| `network/bench.py` | 同一个文件 | 纯 Python，**两个平台通用** |
+
+```bash
+make macos                                 # 编 echo_kqueue / io_macos / bench_client
+./bin/echo_kqueue 19000 &
+./bin/bench_client 19000 8 256             # C++ 客户端（实测 ~96k QPS）
+bin/io_macos /tmp/t.dat 4096 8192 1 1 256  # F_NOCACHE 磁盘基准
+```
+
+`make disk` / `make net` 这类 Linux 目标在 macOS 上会打印一句提示并跳过，不会报一堆头文件错误。
+
+> **宿主机实测**（Apple Silicon，回环 + APFS SSD）：kqueue 单线程 **~96k QPS**；
+> 真实 NVMe 单线程 4KB 同步写 **7.0~8.1 万 IOPS**（是 VM 虚拟盘的约 9 倍）。
+> 有意思的是：macOS 上**多线程写反而越并发越慢**（1 线程 7~8 万 → 32 线程 1.5~2.1 万），
+> 因为没有内核级异步提交队列，「并发深度」只能靠线程堆 —— 这恰好说明 libaio / io_uring 的价值。
 
 ---
 
@@ -516,6 +560,16 @@ ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
 
 ## 已知限制
 
+- **测量介质会改变结论（最重要的一条）**：磁盘实验的测试文件必须落在**真实本地磁盘**上。
+  放到 sshfs（FUSE over SFTP，本质是网络文件系统）里时，「异步靠深度换吞吐」会**完全反过来** ——
+  实测同一台 VM、同一份代码：本地盘 libaio 是同步的 **23.8x**，sshfs 上只有 **0.61x**；
+  更阴的是 `O_DIRECT` 在 sshfs 上**打开成功但被忽略**，不报任何错。
+  另外 `/tmp` **不一定**是磁盘（有的发行版是 tmpfs 内存盘，同步写能测出 163 万 IOPS）。
+  现在 `bench_matrix.py` 会自动挑真实本地盘、并在报告里标注介质、对危险介质给强警告。
+  完整对照实验见 **[测量环境与复现.md](./docs/测量环境与复现.md)**。
+- **多台机器共用一份 `bin/` 会互相覆盖**：工作区挂载进多台 VM 时，`bin/` 是共享的，
+  后 `make` 的机器会盖掉先 `make` 的产物（症状：`libaio.so.1t64: cannot open shared object file`）。
+  现在 `bin/.build-stamp` 会记下编译主机，`bench_matrix.py` 开跑前核对，不匹配直接拒绝执行。
 - **io_uring 在部分容器/沙箱环境不可用**：seccomp 默认拦截 `io_uring_setup`（返回 `EPERM`）。
   代码可正常编译，运行时会提示 `[环境限制]` 并返回退出码 2。跑 `make check` 可确认。
 - **libaio 在 buffered 模式下会退化**：这不是 bug，而是 page cache 让异步开销得不偿失 —— 这本身就是一个值得观察的实验结论。
@@ -538,4 +592,7 @@ ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
 
 文档中的所有性能数据（QPS、IOPS、ns/次、系统调用次数）均来自实验环境实际测量，
 **绝对值会因 CPU、磁盘类型、内核版本、容器限制而显著不同**，请以自己的实测结果为准。
+**每个数字的测量介质（VM 本地盘 / 回环 / 宿主机 SSD）与完整对照实验见
+[测量环境与复现.md](./docs/测量环境与复现.md)** —— 例如 io_uring 的磁盘写在
+内核 5.15 上只有 libaio 的 0.23x（被 punt 到 io-wq），在 7.0 上已追到 0.89x。
 可复现的**相对关系**（如 O_DIRECT 下异步 >> 同步、epoll ~11 次系统调用/消息）才是本项目的核心结论。
