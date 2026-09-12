@@ -58,12 +58,14 @@ BINDIR   := $(ROOT)/bin
 NETDIR   := $(ROOT)/network
 DISKDIR  := $(ROOT)/disk
 LIBCODIR := $(ROOT)/libco
+EXDIR    := $(ROOT)/examples
 TPDIR    := $(ROOT)/third_party
 LIBCO_SRC?= $(TPDIR)/libco
 
 # ---- 目标 ----
 DISK_TARGETS := $(BINDIR)/io_sync $(BINDIR)/io_libaio $(BINDIR)/io_uring_disk
 EPOLL_DEMOS  := $(BINDIR)/epoll_nonblock_demo $(BINDIR)/epoll_starve_demo
+EXAMPLES     := $(BINDIR)/ex_epoll_echo $(BINDIR)/ex_io_uring_echo $(BINDIR)/ex_libaio_rw
 NET_TARGETS  := $(BINDIR)/echo_epoll $(BINDIR)/echo_epoll_mt $(BINDIR)/echo_io_uring \
                 $(BINDIR)/echo_io_uring_adv \
                 $(BINDIR)/reactor_server $(BINDIR)/bench_client
@@ -82,7 +84,7 @@ ifeq ($(URING_MODERN_OK),yes)
 NET_TARGETS += $(BINDIR)/echo_io_uring_modern
 endif
 
-.PHONY: all disk net demos libco bench bench_demo bench_net bench_net_matrix \
+.PHONY: all disk net demos examples libco bench bench_demo bench_net bench_net_matrix \
         bench_disk_matrix check clean help
 
 all: disk net demos
@@ -96,6 +98,7 @@ help:
 	@echo "    make net        只编译网络 (echo_epoll / echo_epoll_mt / echo_io_uring[_adv|_modern] / reactor_server / bench_client)"
 	@echo "                    _modern 需要 liburing >= 2.6，老环境会自动跳过并提示"
 	@echo "    make demos      只编译 epoll O_NONBLOCK 验证 demo"
+	@echo "    make examples   只编译 docs/md/04~06 三篇编程指南的配套示例"
 	@echo "    make libco      编译 libco 与协程 bench（需先 clone 到 third_party/libco）"
 	@echo ""
 	@echo "  运行："
@@ -327,6 +330,23 @@ bench_net_matrix: net
 #   python3 scripts/bench_matrix.py disk --bytes 268435456 --file /data/iodemo
 bench_disk_matrix: disk
 	@python3 $(ROOT)/scripts/bench_matrix.py disk --mode $(MODE)
+
+# ================= 教学示例 =================
+# 与 docs/md/04~06 三篇编程指南配套的最小可运行示例。刻意写得「教科书式正确」：
+# 非阻塞、ET 读空、循环写、对齐、批量收割等该做的都做了，适合当模板抄。
+examples: | $(BINDIR) $(EXAMPLES)
+
+$(BINDIR)/ex_epoll_echo: $(EXDIR)/epoll_echo.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo "  [OK] ex_epoll_echo"
+
+$(BINDIR)/ex_io_uring_echo: $(EXDIR)/io_uring_echo.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)
+	@echo "  [OK] ex_io_uring_echo"
+
+$(BINDIR)/ex_libaio_rw: $(EXDIR)/libaio_rw.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(LIBAIO_LIB)
+	@echo "  [OK] ex_libaio_rw"
 
 # ================= 清理 =================
 clean:

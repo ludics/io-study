@@ -43,7 +43,13 @@ io-study/
 │
 ├── docs/
 │   ├── html/             三份分析文档（HTML 版，浏览器打开，含图表）
-│   └── md/               三份分析文档（Markdown 版，便于检索/版本管理）
+│   ├── md/               分析文档 + 三篇编程指南 + 结论总结（Markdown 版）
+│   └── 挂载方案对比.md    sshfs（multipass 默认）vs virtiofs 的实测对比与规避办法
+│
+├── examples/             教学示例（与 docs/md/04~06 三篇编程指南配套，make examples）
+│   ├── epoll_echo.c          epoll 版 echo，教科书式正确（ET 读空 / 循环写 / 非阻塞）
+│   ├── io_uring_echo.c       io_uring 版 echo，刻意不用 SQPOLL 以便看清提交/收割
+│   └── libaio_rw.c           libaio 异步读写，含 O_DIRECT 对齐与批量收割
 │
 ├── network/              网络 I/O
 │   ├── reactor_server.c      Reactor 模式 echo server（ET + 非阻塞）
@@ -309,10 +315,26 @@ python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 | Reactor 与 Proactor：命名渊源、io_uring 详解 | [html](./docs/html/reactor_proactor_io_uring详解.html) | [md](./docs/md/02-reactor-proactor-io_uring.md) |
 | libco 如何使用 epoll（源码 + 汇编级分析） | [html](./docs/html/libco_epoll源码分析.html) | [md](./docs/md/03-libco-epoll-源码分析.md) |
 
+**三篇编程指南**（讲「怎么用」：API 语义 + 内核行为 + 完整示例 + 陷阱清单 + 实测数字）：
+
+| 文档 | 内容概要 |
+| --- | --- |
+| [深入浅出 epoll 编程](./docs/md/04-epoll-编程指南.md) | 四个 API 逐个讲、LT/ET 的内核实现差异、回调路径、11 条陷阱、每条消息 3.0 次系统调用的由来 |
+| [深入浅出 io_uring 编程](./docs/md/05-io_uring-编程指南.md) | SQ/CQ 三个内存结构、提交与收割的三种风格、SQPOLL/提供缓冲区/固定文件表/零拷贝、如何把系统调用降到 0 |
+| [深入浅出 libaio 编程](./docs/md/06-libaio-编程指南.md) | iocb/io_submit/io_getevents 三件套、为什么只有 `O_DIRECT` 是真异步、深度换吞吐 25 倍、与 io_uring 的取舍 |
+
+**两份总结**：
+
+| 文档 | 内容概要 |
+| --- | --- |
+| [结论：网络 I/O 与磁盘 I/O 谁快谁慢](./docs/md/07-结论-网络IO与磁盘IO.md) | 8 个实现、两台 VM、十几个维度后的结论；跨网络/磁盘都成立的 5 条第一性原理；选型指南 |
+| [挂载方案对比：sshfs vs virtiofs](./docs/挂载方案对比.md) | multipass 两种挂载的实测差异（元数据差 400 倍）、属性缓存对 `make` 的影响、三种规避方案 |
+
 另外还有一份 **[学习路径.md](./docs/学习路径.md)**：写给刚接触 Linux I/O 的人 ——
 三根概念轴、前置知识清单、按顺序的动手实验、延伸阅读、五个常见误区，以及「怎么算学明白了」的自测题。
 
-阅读顺序建议：**01 → 02 → 03**，即从「epoll 怎么用」到「为什么这么设计」再到「协程如何封装 epoll」。
+阅读顺序建议：**01 → 02 → 03**（原理），然后 **04 → 05 → 06**（编程），最后 **07**（结论）。
+只想快速看答案的话，直接读 07。
 
 ---
 
@@ -503,6 +525,12 @@ ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
 - **Python 压测端可能先饱和**：`network/bench.py` 是多线程 Python，受 GIL 限制单进程约 1 核到顶，
   会把各服务端的差异压平。矩阵工具的「自动观察」会给出判断；要测服务端上限请换
   `--client cpp`（`bin/bench_client`，C++ 无 GIL）。
+- **工作区挂载（multipass sshfs）的元数据很慢**：在挂载目录里做小文件密集操作（`git status`、
+  大量小文件、文件监听）会明显变慢 —— 实测元数据比 VM 本地盘慢约 400 倍、小文件创建慢 171 倍。
+  更要注意：sshfs 有**约 1 秒的属性缓存**，宿主刚改完文件时 `make` 可能因为 mtime 是旧值而
+  **跳过重编**（文件*内容*读取不受影响）。规避办法：编译用 `make -B`，
+  或把产物落到本地盘 `make BINDIR=/home/ubuntu/iobin`。
+  完整实测与三种方案见 **[挂载方案对比.md](./docs/挂载方案对比.md)**。
 
 ---
 

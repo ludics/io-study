@@ -17,3 +17,9 @@ uring_trace.txt
 # Python 缓存（在虚拟机上跑 py_compile 会写进共享目录）
 __pycache__/
 *.pyc
+
+# 临时测试目录（挂载/缓存实验会在这里造文件；别再误提交）
+.mnt_test/
+.mnt2/
+.cache_test/
+.sync_test/
