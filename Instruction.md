@@ -2,7 +2,7 @@
 
 在真实 Linux 服务器上复现全部实验（**重点：跑通 io_uring**）。
 
-> 本文所有命令均在服务器上执行，**除特殊说明外都在项目根目录 `io-study/` 下运行**。全程约 15~30 分钟。
+> 本文所有命令均在服务器上执行，**除特殊说明外都在项目根目录 `io-study/` 下运行**。全程约 20~40 分钟（含网络多维矩阵实验）。
 >
 > 关键前提：项目内所有 Makefile / 脚本均使用**相对路径**，整个目录可以拷到任何位置运行。
 
@@ -35,29 +35,35 @@ uname -r
 
 **这是最常见的坑**。即使在物理机上，如果程序跑在 Docker/K8s 容器里，默认 seccomp 策略也会**禁用 io_uring**。
 
-一键检测：
+一键检测（直接用项目自带探针，它会把 errno 翻译成人话）：
 
 ```bash
-cat > /tmp/probe_uring.c <<'EOF'
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <errno.h>
-#include <string.h>
-int main() {
-    errno = 0;
-    long r = syscall(425 /* __NR_io_uring_setup on x86_64 */, 256, (void*)0);
-    printf("io_uring_setup : ret=%ld errno=%d (%s)\n", r, errno, strerror(errno));
-    return 0;
-}
-EOF
-gcc -o /tmp/probe_uring /tmp/probe_uring.c && /tmp/probe_uring
+gcc -O2 -o /tmp/uring_probe scripts/uring_probe.c && /tmp/uring_probe
 ```
 
 **判定**：
 
-- `ret=3`（或任意 ≥0）→ io_uring **可用** ✅
-- `ret=-1 errno=1 (Operation not permitted)` → **被 seccomp 禁用** ❌
+| 结果 | 含义 |
+|------|------|
+| `可用 ✅` | 一切正常，继续 |
+| `不可用 ❌ errno=1 (Operation not permitted)` | 被 seccomp / LSM 拦截 |
+| `不可用 ❌ errno=38 (Function not implemented)` | 内核 < 5.1 或编译内核时关掉了 io_uring |
+| `不可用 ❌ errno=14 (Bad address)` | **探针参数写法有误**，不是环境问题（见下方说明） |
+
+> ⚠️ **不要用「传 NULL 当 params」的写法做探测**。常见的一段错误探针是这样的：
+>
+> ```c
+> // ❌ 错误示例：第二个参数必须是 struct io_uring_params *，传 NULL 内核一律返回 EFAULT(14)
+> long r = syscall(425 /* __NR_io_uring_setup */, 256, (void*)0);
+> ```
+>
+> `io_uring_setup(entries, params)` 的 `params` 是指向 `struct io_uring_params` 的**指针**，
+> 内核会对它做 `copy_from_user`。传 `NULL` 时内核返回 `EFAULT (14, Bad address)` ——
+> **这恰恰说明内核允许 io_uring、也执行到了该逻辑**，只是探针自己传错了参数。
+> 正确写法必须传一个零初始化的结构体（`scripts/uring_probe.c` 就是这么做的）。
+>
+> 系统调用号在 `x86_64 / aarch64 / riscv64` 上都是 **425**（asm-generic 表），
+> 但更稳妥的是直接用 `<sys/syscall.h>` 里的 `__NR_io_uring_setup`。
 
 若在容器中遇到 EPERM，解决方式（选一）：
 
@@ -69,7 +75,9 @@ docker run --security-opt seccomp=/path/to/io_uring-seccomp.json ...
 # K8s：设置 privileged 或自定义 seccompProfile: Unconfined
 ```
 
-> 我在沙箱里就是卡在这一步（`errno=1 EPERM`），所以 io_uring 只编译未运行。你在物理机上大概率能跑通。
+> 我在沙箱里就是卡在这一步（`errno=1 EPERM`），所以当时 io_uring 只编译未运行。
+> 本项目已在 **aarch64 / Ubuntu 22.04 / 内核 5.15.0-generic** 上实测跑通：探针返回可用，
+> `echo_io_uring` 回显正常 —— 说明 **aarch64 与 x86_64 一样可用**，系统调用号同为 425。
 
 ### 0.4 安装依赖
 
@@ -108,10 +116,11 @@ io-study/
 │   └── md/             # 三份分析文档（Markdown）
 ├── network/            # 网络 I/O：epoll / io_uring Echo Server
 │   ├── reactor_server.c
-│   ├── echo_epoll.c
+│   ├── echo_epoll.c          # 单线程 Reactor
+│   ├── echo_epoll_mt.c       # 多线程 Reactor（SO_REUSEPORT）
 │   ├── echo_io_uring.c
 │   ├── bench_client.cpp
-│   ├── bench.py
+│   ├── bench.py              # 压测客户端（连接数/预热/延迟分位/JSON）
 │   └── strace_epoll实测.txt
 ├── disk/               # 磁盘 I/O：sync / libaio / io_uring + epoll 验证实验
 │   ├── io_common.h
@@ -125,7 +134,10 @@ io-study/
 │   └── compare.sh
 ├── scripts/            # 环境体检 + 一键实验
 │   ├── check_env.sh
-│   └── run_all_bench.sh
+│   ├── run_all_bench.sh
+│   ├── uring_probe.c         # io_uring 可用性探针（会翻译 errno）
+│   ├── bench_disk_matrix.sh  # 磁盘多维矩阵压测
+│   └── bench_net_matrix.sh   # 网络多维矩阵压测（产出 results/ 报表）
 └── third_party/        # libco 源码 clone 到这里（可选，make libco 时用）
 ```
 
@@ -143,7 +155,7 @@ make help       # 查看所有目标
 
 ```
 bin/io_sync  bin/io_libaio  bin/io_uring_disk
-bin/echo_epoll  bin/echo_io_uring  bin/reactor_server  bin/bench_client
+bin/echo_epoll  bin/echo_epoll_mt  bin/echo_io_uring  bin/reactor_server  bin/bench_client
 bin/epoll_nonblock_demo  bin/epoll_starve_demo
 ```
 
@@ -210,6 +222,48 @@ done
 ```
 
 **预期**：IOPS 随 depth 上升，到某点后趋于平缓（磁盘队列饱和）。这直观展示「异步 I/O 靠并发深度换吞吐」。
+
+### 2.5 磁盘 I/O 多维度矩阵对比（推荐重点跑）
+
+2.1~2.4 都是单点验证。矩阵实验沿三个维度扫描，每个维度横跨 同步 / libaio / io_uring：
+
+```bash
+make bench_disk_matrix                 # quick，约 1~2 分钟
+make bench_disk_matrix MODE=full       # 更细的扫点
+
+# 需要指定真实磁盘路径 / 调整 I/O 量时直接调脚本：
+BYTES=268435456 FILE=/data/iodemo bash scripts/bench_disk_matrix.sh full
+```
+
+| 维度 | 扫描范围 | 固定参数 |
+|------|---------|---------|
+| **A. 队列深度** | 1 → 128 | 4KB / O_DIRECT |
+| **B. 块大小** | 512B → 256KB | depth=32 / O_DIRECT |
+| **C. O_DIRECT** | 开 / 关 | 4KB / depth=32 |
+
+产物在 `results/` 下：`disk_matrix_<模式>_<时间戳>.md`（表 + 自动观察）、`.csv`、`.log`。
+
+> ⚠️ **测试文件必须落在真实文件系统上**，tmpfs/ramfs 不支持 O_DIRECT。
+> 脚本会自动检测并警告（`df -T`）。默认路径 `/tmp/iodemo_matrix`。
+
+**预期结果**（括号内是 aarch64 Ubuntu 22.04 虚拟机实测，仅看相对关系）：
+
+1. **同步方式完全不吃深度**：depth 1→32，同步写 IOPS 一直在 8k 附近。
+   而 **libaio 从 8.3k 涨到 213.3k（27.4x）** —— 异步的吞吐来自并发深度。
+2. **io_uring 写只爬到 libaio 的一半**（103.6k vs 213.3k），**但读完全持平**（240k vs 238k）。
+   原因是内核把 **O_DIRECT 写甩给了 io-wq 工作线程池**，每次 I/O 多一次跨线程交接；
+   读不需要 punt，所以没有这笔开销。可以这样复现：
+   ```bash
+   ./bin/io_uring_disk /tmp/t 4096 65536 32 1 & sleep 0.2
+   ps -o comm= -L -p $(pgrep -n io_uring_disk) | sort | uniq -c   # 会看到一堆 iou-wrk-*
+   ```
+3. **buffered 数字虚高**：同步 buffered 写 1.46M IOPS（5.7 GB/s）vs O_DIRECT 8.4k
+   —— page cache 把真实磁盘行为整个盖住了，量级差 100 倍以上。
+4. **块大小是 IOPS 与带宽的取舍**：512B→64KB 时写 IOPS 基本不变，但写带宽涨了 113 倍。
+
+> 另：`disk/io_uring_disk.c` 已改为**批量收割**（一次 `io_uring_wait_cqe` 等待 +
+> `io_uring_for_each_cqe` 一次取走 CQ 里所有完成事件）。如果按「每个完成事件调用一次
+> `io_uring_wait_cqe`」写，一批 32 个 I/O 就要进内核最多 32 次，把 Proactor 的红利全吃掉。
 
 ---
 
@@ -294,6 +348,68 @@ epoll_ctl(4, EPOLL_CTL_DEL, 5, NULL) = 0
 ```
 
 **这是本次验证最有说服力的证据** —— 请重点对比这两个 trace 的行数。
+
+### 3.4 网络 I/O 多维度矩阵对比（推荐重点跑）
+
+3.2 只跑了**一个**场景，无法回答「什么条件下谁更快」。矩阵实验沿三个维度扫描
+（并发连接数 / 消息大小 / TCP_NODELAY），每个维度横跨全部可用服务端：
+
+```bash
+make bench_net_matrix              # quick 模式，约 3~5 分钟
+make bench_net_matrix MODE=full    # 更细的扫点，约 10~20 分钟
+
+# 或者直接调脚本，参数更灵活：
+SECS=3 WARMUP=1 CLIENT_THREADS=8 bash scripts/bench_net_matrix.sh quick
+
+# ⭐ 测服务端真实上限：换用 C++ 客户端（无 GIL）
+SECS=3 CLIENT=cpp CLIENT_THREADS=16 MT_WORKERS=4 bash scripts/bench_net_matrix.sh quick
+```
+
+> **为什么一定要跑 CLIENT=cpp 那一遍？**
+> `network/bench.py` 是 Python 多线程，受 **GIL** 限制，单进程大约吃到 **1 核** 就到顶。
+> 在一台 8 核机器上实测：Python 客户端下 epoll 与 io_uring 都只有 ~33k QPS、看起来「性能相当」；
+> 换成 C++ 客户端后，同一个 io_uring 服务端能跑到 ~74k，多线程 epoll 更是到 ~308k。
+> **结论完全相反** —— Python 客户端的上限会把服务端的差异整个压平。
+> 报表的「自动观察」会据此提示瓶颈归属（看 `client_cpu_pct` 是否已到 1 核）。
+
+服务端覆盖：`echo_epoll`（单线程 Reactor）、`echo_epoll_mt`（多 Reactor，SO_REUSEPORT）、
+`echo_io_uring`（Proactor）、`example_echosvr`（libco 协程，需先 `make libco`）。
+未编译的服务端会标记为 `N/A`，不影响其余部分。
+
+> `echo_epoll` / `echo_epoll_mt` / `echo_io_uring` 都认 `ECHO_NODELAY=1`（对新连接设置 TCP_NODELAY），
+> `echo_epoll_mt` 另认 `ECHO_LT=1`（切电平触发）——矩阵脚本会自动注入。libco 示例服务端不支持，
+> 故不参与维度 C，报表中会注明。
+
+跑完在 `results/` 下产出三个文件：
+
+| 文件 | 内容 |
+|------|------|
+| `net_matrix_<模式>_<时间戳>.md` | 对比表（每个维度一张 QPS 表 + 一张 p99 表）+ 自动观察 |
+| `net_matrix_<模式>_<时间戳>.csv` | 原始数据（dim, server, conns, size, nodelay, total, qps, p50, p99, max, errors） |
+| `net_matrix_<模式>_<时间戳>.log` | 完整控制台日志 |
+
+**预期结果**（下面括号里是 aarch64 / Ubuntu 22.04 / 8 vCPU 虚拟机的实测值，供对照）：
+
+1. **维度 A（连接数）**：并发度 = 连接数（每条连接 1 个在途请求），所以 QPS 随连接数
+   近似线性上升，直到某个资源饱和。实测 ^1：1 连接时三者都 ~23k（受单次 RTT 限制），
+   64 连接时 epoll 单线程 76.6k、io_uring 73.6k、**epoll 多线程(4 worker) 308.1k**。
+2. **维度 B（消息大小）**：小包（64B）系统调用次数主导、大包（4KB）内存拷贝/带宽主导。
+   实测 epoll 单线程 77.5k → 74.1k（QPS 略降），但单位时间字节数涨了约 **61 倍**。
+3. **维度 C（TCP_NODELAY）**：ping-pong 下单连接只有一个未完成包，Nagle 基本不触发，
+   所以开/关差异通常很小；若差异明显，说明撞上了 Nagle 与延迟确认（delayed ACK）互等的经典症状。
+4. **多线程 Reactor vs 单线程**：连接数大时应接近线性扩展。实测 **4.02x**（4 worker），
+   与核数吻合 —— 说明单线程版确实卡在一个核上。
+5. **io_uring vs epoll**：本项目的 io_uring echo 版每条消息都要提交 SQE 并立刻
+   `io_uring_enter` 一次，**没吃到批量提交的红利**，所以在这种 ping-pong 微基准里
+   与 epoll 单线程基本持平（73.6k vs 76.6k，甚至略低）。这恰好反向印证了项目的主结论：
+   **io_uring 的优势来自批量提交与 SQPOLL，而不是「换个 API 就更快」**。
+
+^1 均为 C++ 客户端（`CLIENT=cpp`）实测；Python 客户端下三者都会被压到 ~33k，看不出差异。
+
+> **读结果的第一原则：先确认瓶颈在哪一边。**
+> 如果所有服务端的 QPS 都挤在一起，先怀疑**压测端到顶**，而不是「服务端能力相当」。
+> Python 客户端看 `client_cpu_pct` 是否已到 ~100%（1 核 = GIL 天花板）；
+> 报表的「自动观察」会自动给出这个判断，并建议改用 `CLIENT=cpp`。
 
 ---
 
@@ -393,6 +509,10 @@ bash scripts/run_all_bench.sh net    # 只跑网络 echo 对比
 | io_uring 1 条消息 | 系统调用次数 | *环境禁用* | **← 重点** |
 | epoll 双连接（阻塞fd） | 连接2 延迟 | 3000 ms | |
 | libco 协程切换 | ns/次 | 15.6 ns | |
+| 网络 单线程 epoll（64 连接） | QPS | — | |
+| 网络 多线程 epoll（64 连接） | QPS | — | |
+| 网络 io_uring（64 连接） | QPS | — | |
+| 网络 4KB/64B 消息 | 单位时间字节数比 | — | |
 
 ---
 
@@ -432,8 +552,10 @@ seccomp 禁用。用 0.3 的检测程序确认；若在容器里，需要 `--sec
 | 实验 | 回答的问题 |
 |------|-----------|
 | 磁盘三方对比 | io_uring / libaio 比同步快多少？异步 I/O 价值在哪？ |
+| 磁盘多维矩阵 | 队列深度、块大小、O_DIRECT 各自带来多大变化？为什么 io_uring 写反而没赢？ |
 | buffered vs O_DIRECT | 为什么 libaio 在 page cache 下反而退化？ |
 | Echo Server 对比 | 网络场景下 io_uring 相对 epoll 的优势？ |
+| 网络多维矩阵 | 连接数、消息大小、TCP_NODELAY 各自带来多大变化？单线程 vs 多线程 Reactor 差多少？ |
 | strace 系统调用对比 | **Proactor 比 Reactor 省了多少系统调用？** |
 | epoll O_NONBLOCK 实验 | 为什么阻塞 fd 会饿死整个事件循环？ |
 | libco 协程切换 | 协程切换到底有多快？为什么能「同步写法异步执行」？ |

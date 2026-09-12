@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,14 +9,24 @@
 
 // epoll 版 Echo Server（Reactor 模式）
 // 每个 I/O 事件：epoll_wait 通知就绪 → 应用自己 read/write（同步系统调用）
+//
+// 环境变量 ECHO_NODELAY=1 可对每条连接设置 TCP_NODELAY（默认 0，保持原有行为），
+// 供 scripts/bench_net_matrix.sh 的 NODELAY 维度对比使用。
 
 static void set_nonblock(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+static void set_nodelay(int fd) {
+  int opt = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+}
+
 int main(int argc, char *argv[]) {
   int port = argc > 1 ? atoi(argv[1]) : 19000;
+  const char *nd = getenv("ECHO_NODELAY");
+  int nodelay = nd ? atoi(nd) : 0;
   int lfd = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1;
   setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -45,6 +56,7 @@ int main(int argc, char *argv[]) {
       if (fd == lfd) {
         int cfd = accept(lfd, NULL, NULL);       // 系统调用
         set_nonblock(cfd);
+        if (nodelay) set_nodelay(cfd);
         ev.events = EPOLLIN | EPOLLET;
         ev.data.fd = cfd;
         epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev); // 系统调用

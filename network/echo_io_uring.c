@@ -11,9 +11,13 @@
 // 编译: gcc -O2 -o echo_io_uring echo_io_uring.c -luring
 // 运行: ./echo_io_uring [port]
 // 测试: printf 'hello' | nc 127.0.0.1 [port]
+//
+// 环境变量 ECHO_NODELAY=1 可对新连接设置 TCP_NODELAY（默认 0，保持原有行为），
+// 供 scripts/bench_net_matrix.sh 的 NODELAY 维度对比使用。
 
 #include <arpa/inet.h>
 #include <liburing.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +40,12 @@ static inline int decode_fd(unsigned long data) { return (int)(data & 0xFFFFFFFF
 static inline int decode_op(unsigned long data) { return (int)(data >> 32); }
 
 static int listen_fd_global;
+static int g_nodelay;
+
+static void set_nodelay(int fd) {
+    int opt = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+}
 
 // 提交 accept 请求（user_data 标记 OP_ACCEPT，fd 填 0）
 static void add_accept(struct io_uring *ring) {
@@ -63,6 +73,8 @@ static void add_write(struct io_uring *ring, int fd, void *buf, int len) {
 
 int main(int argc, char *argv[]) {
     int port = argc > 1 ? atoi(argv[1]) : 19001;
+    const char *nd = getenv("ECHO_NODELAY");
+    g_nodelay = nd ? atoi(nd) : 0;
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -125,6 +137,7 @@ int main(int argc, char *argv[]) {
             // accept 完成：res = 新连接的 fd
             if (res >= 0) {
                 int conn_fd = res;
+                if (g_nodelay) set_nodelay(conn_fd);
                 printf("[io_uring] 新连接 fd=%d\n", conn_fd);
                 fflush(stdout);
                 // 为新连接提交读请求

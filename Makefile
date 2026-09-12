@@ -12,6 +12,7 @@
 #    make bench     磁盘 I/O 三方对比（sync / libaio / io_uring）
 #    make bench_demo  epoll 为什么必须 O_NONBLOCK 对比实验
 #    make bench_net   网络 echo 对比（epoll vs io_uring）
+#    make bench_net_matrix  网络 I/O 多维度对比（服务端 × 连接数 × 消息大小 × NODELAY）
 #    make libco     编译 libco（需先 git clone 到 third_party/libco）
 #    make clean     清理
 #
@@ -25,6 +26,8 @@
 #    THREADS 压测客户端线程数  默认 4
 #    SIZE    单条消息字节数    默认 256
 #    SECS    压测时长(秒)      默认 5
+#    MODE    bench_net_matrix 模式 默认 quick（可选 full）
+#    CLIENT  bench_net_matrix 压测端 默认 py（可选 cpp，见 README 实验四）
 # ============================================================
 
 CC       := gcc
@@ -59,10 +62,11 @@ LIBCO_SRC?= $(TPDIR)/libco
 # ---- 目标 ----
 DISK_TARGETS := $(BINDIR)/io_sync $(BINDIR)/io_libaio $(BINDIR)/io_uring_disk
 EPOLL_DEMOS  := $(BINDIR)/epoll_nonblock_demo $(BINDIR)/epoll_starve_demo
-NET_TARGETS  := $(BINDIR)/echo_epoll $(BINDIR)/echo_io_uring \
+NET_TARGETS  := $(BINDIR)/echo_epoll $(BINDIR)/echo_epoll_mt $(BINDIR)/echo_io_uring \
                 $(BINDIR)/reactor_server $(BINDIR)/bench_client
 
-.PHONY: all disk net demos libco bench bench_demo bench_net check clean help
+.PHONY: all disk net demos libco bench bench_demo bench_net bench_net_matrix \
+        bench_disk_matrix check clean help
 
 all: disk net demos
 
@@ -72,7 +76,7 @@ help:
 	@echo "  构建："
 	@echo "    make            编译全部"
 	@echo "    make disk       只编译磁盘 I/O 三版 (sync / libaio / io_uring)"
-	@echo "    make net        只编译网络 (echo_epoll / echo_io_uring / reactor_server / bench_client)"
+	@echo "    make net        只编译网络 (echo_epoll / echo_epoll_mt / echo_io_uring / reactor_server / bench_client)"
 	@echo "    make demos      只编译 epoll O_NONBLOCK 验证 demo"
 	@echo "    make libco      编译 libco 与协程 bench（需先 clone 到 third_party/libco）"
 	@echo ""
@@ -81,11 +85,14 @@ help:
 	@echo "    make bench      磁盘 I/O 对比  (make bench DIRECT=1 走真实磁盘)"
 	@echo "    make bench_demo epoll 为何必须 O_NONBLOCK 的对比实验"
 	@echo "    make bench_net  网络 echo 对比 (epoll vs io_uring)"
+	@echo "    make bench_net_matrix  网络多维矩阵对比 (make bench_net_matrix MODE=full CLIENT=cpp)"
+	@echo "    make bench_disk_matrix 磁盘多维矩阵对比 (连接数无关；深度/块大小/O_DIRECT)"
 	@echo "    make clean      清理 bin/ 与测试文件"
 	@echo ""
 	@echo "  参数覆盖示例："
 	@echo "    make bench TOTAL=65536 BLOCK=4096 DEPTH=32 DIRECT=1"
 	@echo "    make bench_net PORT=18800 THREADS=8 SIZE=512 SECS=5"
+	@echo "    make bench_net_matrix MODE=full"
 
 $(BINDIR):
 	@mkdir -p $(BINDIR)
@@ -122,6 +129,10 @@ net: | $(BINDIR) $(NET_TARGETS)
 $(BINDIR)/echo_epoll: $(NETDIR)/echo_epoll.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $<
 	@echo "  [OK] echo_epoll"
+
+$(BINDIR)/echo_epoll_mt: $(NETDIR)/echo_epoll_mt.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(NET_LIBS)
+	@echo "  [OK] echo_epoll_mt"
 
 $(BINDIR)/echo_io_uring: $(NETDIR)/echo_io_uring.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)
@@ -240,7 +251,7 @@ bench_net: net
 	 kill -9 $$SRV 2>/dev/null; sleep 0.3
 	@echo ""
 	@echo ">>> [2/2] io_uring (Proactor)"
-	@$(BINDIR)/echo_io_uring $(PORT) > /tmp/echo_uring.log 2>&1 & \
+	@$(BINDIR)/echo_io_uring $$((PORT+1)) > /tmp/echo_uring.log 2>&1 & \
 	 SRV=$$!; sleep 1; \
 	 if kill -0 $$SRV 2>/dev/null; then \
 	   python3 $(NETDIR)/bench.py $$((PORT+1)) $(THREADS) $(SIZE) $(SECS) 2>/dev/null || true; \
@@ -252,6 +263,26 @@ bench_net: net
 	@echo "=========================================="
 	@echo "  对比完成"
 	@echo "=========================================="
+
+# ================= 网络多维度矩阵对比 =================
+#   make bench_net_matrix                 quick 模式，Python 压测客户端
+#   make bench_net_matrix MODE=full      更细的扫点
+#   make bench_net_matrix CLIENT=cpp     换 C++ 压测客户端（无 GIL，测服务端上限）
+#
+# 注意：SECS / WARMUP 用脚本自己的默认值（2s / 1s）。要改时长直接调脚本更方便：
+#   SECS=3 CLIENT=cpp bash scripts/bench_net_matrix.sh quick
+bench_net_matrix: net
+	@CLIENT="$(CLIENT)" MT_WORKERS="$(MT_WORKERS)" CLIENT_THREADS="$(CLIENT_THREADS)" \
+	 bash $(ROOT)/scripts/bench_net_matrix.sh $(if $(MODE),$(MODE),quick)
+
+# ================= 磁盘多维度矩阵对比 =================
+#   make bench_disk_matrix                 quick 模式
+#   make bench_disk_matrix MODE=full       更细的扫点
+#
+# 注意：BYTES / FILE / SYNC_TOTAL 用脚本自己的默认值。要调这些直接调脚本更方便：
+#   BYTES=268435456 FILE=/data/iodemo bash scripts/bench_disk_matrix.sh full
+bench_disk_matrix: disk
+	@bash $(ROOT)/scripts/bench_disk_matrix.sh $(if $(MODE),$(MODE),quick)
 
 # ================= 清理 =================
 clean:
