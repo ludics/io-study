@@ -29,8 +29,14 @@ void do_quit(int) {
 }
 
 int main(int argc, char *argv[]) {
+  // 关掉 stdout 的全缓冲：被压测脚本用管道接住时，printf 默认按 4KB 缓冲，
+  // 如果脚本到点直接 kill 掉本进程，缓冲区里还没刷出的 QPS 行就全丢了
+  // （表现为「跑了 5 秒一行输出都没有」）。设成行缓冲后每行立刻可见。
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+
   signal(SIGINT, do_quit);
 
+  // 参数：<端口> [线程数] [消息字节数]
   int port = argc >= 2 ? std::atoi(argv[1]) : 8000;
   int thread = argc >= 3 ? std::atoi(argv[2]) : 1;
   int data_size = argc >= 4 ? std::atoi(argv[3]) : 100;

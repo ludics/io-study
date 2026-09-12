@@ -2,14 +2,18 @@
 # ============================================================
 #  网络 Echo 三方对比：epoll(裸 Reactor) vs libco(协程) vs io_uring(Proactor)
 #
+#  ⚠️ 本脚本是早期版本，功能已被 scripts/bench_matrix.py 覆盖（那个更全：
+#     4 种服务端 × 3 个维度，还带延迟分位和压测端 CPU 占用）。
+#     保留它是因为它足够短、适合当「读代码的入口」。要正经测数据请用：
+#         python3 scripts/bench_matrix.py net --mode full
+#
 #  用法：
 #    ./compare.sh                 # 默认 4 线程 / 256B / 3 秒
 #    ./compare.sh 8 512 5         # 自定义：线程数 消息大小 秒数
 #
 #  前置条件（在项目根目录执行）：
 #    make net      # 编译 bin/echo_epoll、bin/echo_io_uring
-#    make libco    # 编译 third_party/libco/example_echosvr
-#                  #   （需先 git clone 到 third_party/libco）
+#    make libco    # 编译 third_party/libco 并产出 example_echosvr
 #
 #  说明：所有路径均由脚本自身位置推导，不含任何绝对路径，项目可整体搬迁
 # ============================================================
@@ -22,7 +26,10 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN="${PROJECT_ROOT}/bin"
 NET="${PROJECT_ROOT}/network"
 BENCH="${NET}/bench.py"
-LIBCO_ECHO="${PROJECT_ROOT}/third_party/libco/example_echosvr"
+
+# libco 有两种布局：重构版在 build/bin/ 下，上游原版在根目录
+LIBCO_ECHO="${PROJECT_ROOT}/third_party/libco/build/bin/example_echosvr"
+[ -x "$LIBCO_ECHO" ] || LIBCO_ECHO="${PROJECT_ROOT}/third_party/libco/example_echosvr"
 
 EPOLL_BIN="${BIN}/echo_epoll"
 URING_BIN="${BIN}/echo_io_uring"

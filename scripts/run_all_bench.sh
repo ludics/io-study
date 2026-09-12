@@ -83,13 +83,13 @@ fi
 # ---------- 5. 网络多维矩阵 ----------
 if [ "$MODE" = "all" ] || [ "$MODE" = "matrix" ]; then
     banner "步骤 5 / 6：网络 I/O 多维度矩阵对比"
-    bash scripts/bench_net_matrix.sh "${MATRIX_MODE:-quick}"
+    python3 scripts/bench_matrix.py net --mode "${MATRIX_MODE:-quick}"
 fi
 
 # ---------- 6. 磁盘多维矩阵 ----------
 if [ "$MODE" = "all" ] || [ "$MODE" = "disk_matrix" ]; then
     banner "步骤 6 / 6：磁盘 I/O 多维度矩阵对比"
-    bash scripts/bench_disk_matrix.sh "${MATRIX_MODE:-quick}"
+    python3 scripts/bench_matrix.py disk --mode "${MATRIX_MODE:-quick}"
 fi
 
 echo ""

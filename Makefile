@@ -26,8 +26,8 @@
 #    THREADS 压测客户端线程数  默认 4
 #    SIZE    单条消息字节数    默认 256
 #    SECS    压测时长(秒)      默认 5
-#    MODE    bench_net_matrix 模式 默认 quick（可选 full）
-#    CLIENT  bench_net_matrix 压测端 默认 py（可选 cpp，见 README 实验四）
+#    MODE    bench_*_matrix 的扫描档位  默认 quick（可选 full）
+#    CLIENT  bench_net_matrix 压测端     默认 py（可选 cpp，见 README 实验四）
 # ============================================================
 
 CC       := gcc
@@ -49,6 +49,8 @@ PORT    ?= 18800
 THREADS ?= 4
 SIZE    ?= 256
 SECS    ?= 5
+MODE    ?= quick
+CLIENT  ?= py
 
 # ---- 目录（全部相对，方便整体拷走）----
 ROOT     := $(shell pwd)
@@ -147,6 +149,9 @@ $(BINDIR)/bench_client: $(NETDIR)/bench_client.cpp | $(BINDIR)
 	@echo "  [OK] bench_client"
 
 # ================= libco =================
+# third_party/libco 支持两种布局（本仓库用的是「重构版」）：
+#   重构版：build/lib/libcolib.a + build/bin/example_echosvr + src/ 下放头文件
+#   上游原版：根目录 libco.a + example_echosvr + 头文件在根目录
 libco:
 	@if [ ! -d "$(LIBCO_SRC)" ]; then \
 		echo "未找到 libco 源码，请先执行："; \
@@ -155,13 +160,18 @@ libco:
 	fi
 	@echo ">>> 编译 libco ..."
 	@$(MAKE) -C $(LIBCO_SRC) --no-print-directory 2>&1 | tail -5
-	@echo ">>> 编译协程上下文切换 bench ..."
-	@LIBCO_A=$$(ls $(LIBCO_SRC)/*.a 2>/dev/null | head -1); \
-	if [ -z "$$LIBCO_A" ]; then echo "  [失败] 未找到 libco 静态库"; exit 1; fi; \
-	$(CXX) $(CXXFLAGS) -I$(LIBCO_SRC) -o $(BINDIR)/bench_swap $(LIBCODIR)/bench_swap.cpp $$LIBCO_A $(NET_LIBS) \
+	@set -e; \
+	LIBCO_A=$$(ls $(LIBCO_SRC)/build/lib/libcolib.a $(LIBCO_SRC)/*.a 2>/dev/null | head -1); \
+	if [ -z "$$LIBCO_A" ]; then echo "  [失败] 未找到 libco 静态库（build/lib/libcolib.a 或 libco.a）"; exit 1; fi; \
+	if [ -f "$(LIBCO_SRC)/src/co_routine.h" ]; then LIBCO_INC="$(LIBCO_SRC)/src"; else LIBCO_INC="$(LIBCO_SRC)"; fi; \
+	echo "  静态库: $$LIBCO_A"; \
+	echo "  头文件: $$LIBCO_INC"; \
+	$(CXX) $(CXXFLAGS) -I$$LIBCO_INC -o $(BINDIR)/bench_swap $(LIBCODIR)/bench_swap.cpp $$LIBCO_A $(NET_LIBS) \
 	  && echo "  [OK] bench_swap"
 	@echo ">>> libco 示例 echo server："
-	@ls $(LIBCO_SRC)/example_echosvr 2>/dev/null || echo "  (未生成 example_echosvr，请查看 $(LIBCO_SRC) 下 Makefile 输出)"
+	@ECHO_BIN=$$(ls $(LIBCO_SRC)/build/bin/example_echosvr $(LIBCO_SRC)/example_echosvr 2>/dev/null | head -1); \
+	 if [ -n "$$ECHO_BIN" ]; then echo "  $$ECHO_BIN"; \
+	 else echo "  (未生成 example_echosvr，请查看 $(LIBCO_SRC) 的 Makefile 输出)"; fi
 
 # ================= 环境体检 =================
 check:
@@ -265,24 +275,22 @@ bench_net: net
 	@echo "=========================================="
 
 # ================= 网络多维度矩阵对比 =================
-#   make bench_net_matrix                 quick 模式，Python 压测客户端
-#   make bench_net_matrix MODE=full      更细的扫点
-#   make bench_net_matrix CLIENT=cpp     换 C++ 压测客户端（无 GIL，测服务端上限）
+#   make bench_net_matrix                  quick 模式，Python 压测端
+#   make bench_net_matrix MODE=full        更细的扫点
+#   make bench_net_matrix CLIENT=cpp       换 C++ 压测端（无 GIL，测服务端上限）
 #
-# 注意：SECS / WARMUP 用脚本自己的默认值（2s / 1s）。要改时长直接调脚本更方便：
-#   SECS=3 CLIENT=cpp bash scripts/bench_net_matrix.sh quick
+# 实现见 scripts/bench_matrix.py（网络和磁盘共用一个工具，纯 Python，无 shell 嵌套）
 bench_net_matrix: net
-	@CLIENT="$(CLIENT)" MT_WORKERS="$(MT_WORKERS)" CLIENT_THREADS="$(CLIENT_THREADS)" \
-	 bash $(ROOT)/scripts/bench_net_matrix.sh $(if $(MODE),$(MODE),quick)
+	@python3 $(ROOT)/scripts/bench_matrix.py net --mode $(MODE) --client $(CLIENT)
 
 # ================= 磁盘多维度矩阵对比 =================
 #   make bench_disk_matrix                 quick 模式
 #   make bench_disk_matrix MODE=full       更细的扫点
 #
-# 注意：BYTES / FILE / SYNC_TOTAL 用脚本自己的默认值。要调这些直接调脚本更方便：
-#   BYTES=268435456 FILE=/data/iodemo bash scripts/bench_disk_matrix.sh full
+# BYTES / FILE 等参数请直接调脚本（更好读）：
+#   python3 scripts/bench_matrix.py disk --bytes 268435456 --file /data/iodemo
 bench_disk_matrix: disk
-	@bash $(ROOT)/scripts/bench_disk_matrix.sh $(if $(MODE),$(MODE),quick)
+	@python3 $(ROOT)/scripts/bench_matrix.py disk --mode $(MODE)
 
 # ================= 清理 =================
 clean:

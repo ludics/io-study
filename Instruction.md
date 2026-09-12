@@ -136,8 +136,7 @@ io-study/
 │   ├── check_env.sh
 │   ├── run_all_bench.sh
 │   ├── uring_probe.c         # io_uring 可用性探针（会翻译 errno）
-│   ├── bench_disk_matrix.sh  # 磁盘多维矩阵压测
-│   └── bench_net_matrix.sh   # 网络多维矩阵压测（产出 results/ 报表）
+│   └── bench_matrix.py       # 矩阵压测工具（网络 + 磁盘，产出 results/ 报表）
 └── third_party/        # libco 源码 clone 到这里（可选，make libco 时用）
 ```
 
@@ -232,7 +231,7 @@ make bench_disk_matrix                 # quick，约 1~2 分钟
 make bench_disk_matrix MODE=full       # 更细的扫点
 
 # 需要指定真实磁盘路径 / 调整 I/O 量时直接调脚本：
-BYTES=268435456 FILE=/data/iodemo bash scripts/bench_disk_matrix.sh full
+python3 scripts/bench_matrix.py disk --mode full --bytes 268435456 --file /data/iodemo
 ```
 
 | 维度 | 扫描范围 | 固定参数 |
@@ -311,7 +310,7 @@ make bench_net PORT=19000 THREADS=8 SIZE=512 SECS=5
 
 ```bash
 # epoll 版
-strace -f -e trace=epoll_wait,accept,read,write,epoll_ctl -o /tmp/ep_trace.txt ./bin/echo_epoll 19000 &
+strace -f -e trace=epoll_pwait,epoll_wait,accept,accept4,read,write,epoll_ctl -o /tmp/ep_trace.txt ./bin/echo_epoll 19000 &
 sleep 1
 printf 'X' | nc 127.0.0.1 19000
 kill %1
@@ -359,10 +358,10 @@ make bench_net_matrix              # quick 模式，约 3~5 分钟
 make bench_net_matrix MODE=full    # 更细的扫点，约 10~20 分钟
 
 # 或者直接调脚本，参数更灵活：
-SECS=3 WARMUP=1 CLIENT_THREADS=8 bash scripts/bench_net_matrix.sh quick
+python3 scripts/bench_matrix.py net --secs 3
 
 # ⭐ 测服务端真实上限：换用 C++ 客户端（无 GIL）
-SECS=3 CLIENT=cpp CLIENT_THREADS=16 MT_WORKERS=4 bash scripts/bench_net_matrix.sh quick
+python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 ```
 
 > **为什么一定要跑 CLIENT=cpp 那一遍？**
@@ -404,12 +403,42 @@ SECS=3 CLIENT=cpp CLIENT_THREADS=16 MT_WORKERS=4 bash scripts/bench_net_matrix.s
    与 epoll 单线程基本持平（73.6k vs 76.6k，甚至略低）。这恰好反向印证了项目的主结论：
    **io_uring 的优势来自批量提交与 SQPOLL，而不是「换个 API 就更快」**。
 
-^1 均为 C++ 客户端（`CLIENT=cpp`）实测；Python 客户端下三者都会被压到 ~33k，看不出差异。
+^1 均为 C++ 客户端（`--client cpp`）实测；Python 客户端下三者都会被压到 ~33k，看不出差异。
 
 > **读结果的第一原则：先确认瓶颈在哪一边。**
 > 如果所有服务端的 QPS 都挤在一起，先怀疑**压测端到顶**，而不是「服务端能力相当」。
-> Python 客户端看 `client_cpu_pct` 是否已到 ~100%（1 核 = GIL 天花板）；
-> 报表的「自动观察」会自动给出这个判断，并建议改用 `CLIENT=cpp`。
+> Python 压测端看 `client_cpu_pct` 是否已到 ~100%（1 核 = GIL 天花板）；
+> 报表的「自动观察」会自动给出这个判断，并建议改用 `--client cpp`。
+
+### 3.6 io_uring 到底省了多少系统调用？（附实测）
+
+「io_uring 更少系统调用」这句话要有数字支撑才有意义。用固定 2000 条消息 +
+`strace -c -f` 统计服务端的系统调用总量：
+
+```bash
+# 服务端在 strace 下跑（-c 只输出汇总；-f 跟踪线程）
+strace -c -f -e trace=epoll_pwait,epoll_wait,epoll_ctl,accept,read,write \
+       ./bin/echo_epoll 19701 &
+# 另一个终端灌固定条数的消息，然后 Ctrl-C 让 strace 打印汇总
+```
+
+**实测（2000 条消息）**：
+
+| 服务端 | 主要系统调用 | 总计 | 每条消息 |
+|--------|------------|------|---------|
+| epoll 单线程 | read 2002 + write 2001 + **epoll_pwait 2002** + epoll_ctl 3 | 6009 | **3.0 次** |
+| io_uring | **io_uring_enter 4004**（提交 1 + 收割 1）+ setup 1 | 4005 | **2.0 次** |
+
+结论分两层：
+
+1. io_uring **确实少用 1/3 的系统调用**（2.0 vs 3.0）。
+2. **但吞吐并没有赢**（73.6k vs 76.6k）。所以在这个场景里，系统调用次数**不是瓶颈** ——
+   瓶颈在单核 CPU、内存拷贝和虚机网络路径上。**「省系统调用」只有在系统调用本身成为瓶颈时才有价值。**
+
+> ⚠️ **架构坑**：aarch64（以及 riscv64）上**没有 `epoll_wait` 这个系统调用**，
+> glibc 的 `epoll_wait()` 实际走 `epoll_pwait`。所以 `strace -e trace=epoll_wait` 在 ARM 上
+> 会一条都抓不到（我第一遍就踩了这个坑，统计出来的 epoll 只有 4007 次，少了两千次）。
+> x86_64 上才叫 `epoll_wait`。写 strace 过滤器时两个都带上最稳。
 
 ---
 
@@ -458,13 +487,13 @@ make libco
 `make libco` 会产出：
 
 - `bin/bench_swap` —— 协程切换开销基准
-- `third_party/libco/example_echosvr` —— libco 版 echo server
+- `third_party/libco/build/bin/example_echosvr` —— libco 版 echo server
 
 ### 5.2 验证回显与切换开销
 
 ```bash
 # 验证回显
-./third_party/libco/example_echosvr 127.0.0.1 19900 10 1 &
+./third_party/libco/build/bin/example_echosvr 127.0.0.1 19900 10 1 &
 printf 'Hello libco' | nc 127.0.0.1 19900
 
 # 协程切换开销

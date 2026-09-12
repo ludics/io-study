@@ -70,8 +70,7 @@ io-study/
 │   ├── check_env.sh          环境体检（内核/依赖/io_uring 可用性）
 │   ├── run_all_bench.sh      一键跑通全部实验
 │   ├── uring_probe.c         io_uring 可用性探针（会翻译 errno）
-│   ├── bench_disk_matrix.sh  磁盘 I/O 多维度矩阵压测（产出 results/ 报表 + CSV）
-│   └── bench_net_matrix.sh   网络 I/O 多维度矩阵压测（产出 results/ 报表 + CSV）
+│   └── bench_matrix.py       矩阵压测工具（网络 + 磁盘，纯 Python，产出 results/ 报表）
 │
 └── third_party/          libco 源码 clone 位置（可选，make libco 时用）
 ```
@@ -166,7 +165,7 @@ sudo yum install -y gcc gcc-c++ make libaio-devel liburing-devel strace
 ```bash
 make bench_disk_matrix                 # quick
 make bench_disk_matrix MODE=full       # 更细的扫点
-BYTES=268435456 FILE=/data/iodemo bash scripts/bench_disk_matrix.sh full
+python3 scripts/bench_matrix.py disk --mode full --bytes 268435456 --file /data/iodemo
 ```
 
 产物与网络矩阵一致（`results/disk_matrix_*.md` / `.csv` / `.log`）。
@@ -267,7 +266,7 @@ python3 network/bench.py 19001 8 512 5 --conns 64 --json
 | `CLIENT=cpp` | `bin/bench_client` | C++ 多线程无 GIL，能测出服务端真实上限 | 只有 QPS，没有延迟分位 |
 
 ```bash
-SECS=3 CLIENT=cpp CLIENT_THREADS=16 MT_WORKERS=4 bash scripts/bench_net_matrix.sh quick
+python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 ```
 
 `network/bench.py` 相比初版：**连接数与线程数解耦**（`--conns`，每条连接 1 个在途请求，
@@ -307,6 +306,9 @@ SECS=3 CLIENT=cpp CLIENT_THREADS=16 MT_WORKERS=4 bash scripts/bench_net_matrix.s
 | Reactor 与 Proactor：命名渊源、io_uring 详解 | [html](./docs/html/reactor_proactor_io_uring详解.html) | [md](./docs/md/02-reactor-proactor-io_uring.md) |
 | libco 如何使用 epoll（源码 + 汇编级分析） | [html](./docs/html/libco_epoll源码分析.html) | [md](./docs/md/03-libco-epoll-源码分析.md) |
 
+另外还有一份 **[学习路径.md](./docs/学习路径.md)**：写给刚接触 Linux I/O 的人 ——
+三根概念轴、前置知识清单、按顺序的动手实验、延伸阅读、五个常见误区，以及「怎么算学明白了」的自测题。
+
 阅读顺序建议：**01 → 02 → 03**，即从「epoll 怎么用」到「为什么这么设计」再到「协程如何封装 epoll」。
 
 ---
@@ -334,10 +336,12 @@ SECS=3 CLIENT=cpp CLIENT_THREADS=16 MT_WORKERS=4 bash scripts/bench_net_matrix.s
 - **io_uring 在部分容器/沙箱环境不可用**：seccomp 默认拦截 `io_uring_setup`（返回 `EPERM`）。
   代码可正常编译，运行时会提示 `[环境限制]` 并返回退出码 2。跑 `make check` 可确认。
 - **libaio 在 buffered 模式下会退化**：这不是 bug，而是 page cache 让异步开销得不偿失 —— 这本身就是一个值得观察的实验结论。
-- **libco 需自行 clone**：`make libco` 前需 `git clone https://github.com/Tencent/libco third_party/libco`。
-- **Python 压测端可能先饱和**：`network/bench.py` 是多线程 Python，本机回环小包场景下大约
-  10 万 QPS 就会成为瓶颈。矩阵实验的「自动观察」会在各服务端结果过于接近时主动提示；
-  需要更高压力时请加大 `CLIENT_THREADS`，或改用 `bin/bench_client`。
+- **libco 需自行提供源码**：`make libco` 依赖 `third_party/libco`。支持两种布局
+  （重构版 `build/lib/libcolib.a` + `build/bin/`，或上游原版根目录 `libco.a`）。
+  注意构建产物**不能跨平台复用** —— 在 macOS 上编译出的 `build/` 拿到 Linux 上跑不了，需在目标机重新 `make`。
+- **Python 压测端可能先饱和**：`network/bench.py` 是多线程 Python，受 GIL 限制单进程约 1 核到顶，
+  会把各服务端的差异压平。矩阵工具的「自动观察」会给出判断；要测服务端上限请换
+  `--client cpp`（`bin/bench_client`，C++ 无 GIL）。
 
 ---
 
