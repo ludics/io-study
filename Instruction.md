@@ -494,6 +494,41 @@ ECHO_SQPOLL=1 ECHO_PBUF=1 ECHO_MULTISHOT=1 ECHO_ZC=1 ECHO_SPIN=1 \
 > 再用 `sudo perf report --stdio --percent-limit 1` 看热点。
 > 建议先用 `-g -fno-omit-frame-pointer` 重编译，否则看不到调用栈。
 
+### 3.8 现代写法：`echo_io_uring_modern`（无兼容包袱，最快）
+
+3.7 里的 `adv` 版为了兼容 5.15 + liburing 2.1，塞了手写 ABI 常量、降级分支、
+自实现的缓冲区环入队。`network/echo_io_uring_modern.c` 只面向**内核 ≥6.6 + liburing ≥2.6**，
+把这些包袱全删掉，所有特性用 liburing 现成辅助函数写：
+
+```bash
+make net
+# SQPOLL 的内核线程是忙轮询的，必须给它独立一个核（否则比不开还慢）
+ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
+```
+
+**实测（内核 7.0，16 线程 × 256B，交替 5 轮取中位）**：
+
+| 服务端 | 核 | QPS |
+|---|---|---|
+| epoll 单线程 | 1 | 112k |
+| adv 全特性（开零拷贝） | 2 | 185k |
+| **modern 全特性（关零拷贝，默认）** | 2 | **233k（2.08x）** |
+
+**稳态系统调用 = 0**（`perf stat -e syscalls:sys_enter_io_uring_enter`）：
+全特性 0 次/消息；关掉忙轮询 0.14 次；两个都关 1.02 次。
+
+三个反直觉结论：
+
+1. **零拷贝在小消息下更慢**（233k → 175k，-26%）：`SEND_ZC` 每次发送产生两个 CQE，
+   256B 消息省下的拷贝不值这个开销。现代版因此**默认关闭**（`ECHO_ZC=1` 可开）。
+2. **固定文件表/direct accept 在这个量级没有可测量收益**（7 轮 A/B 中位都是 222k）——
+   理论收益要到大连接数才显现。
+3. **`COOP_TASKRUN` / `DEFER_TASKRUN` 与 `SQPOLL` 互斥**（一起写返回 `EINVAL`），
+   `SINGLE_ISSUER` 可以共存。
+
+> 注意 `make net` 会探测本机 liburing：老发行版（如 Ubuntu 22.04 的 2.1）缺少所需 API 时
+> 会**自动跳过这个目标并提示**，不影响其余目标。
+
 ---
 
 ## 第 4 步：epoll 为什么必须 O_NONBLOCK（实验验证）

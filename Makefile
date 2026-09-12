@@ -65,7 +65,22 @@ LIBCO_SRC?= $(TPDIR)/libco
 DISK_TARGETS := $(BINDIR)/io_sync $(BINDIR)/io_libaio $(BINDIR)/io_uring_disk
 EPOLL_DEMOS  := $(BINDIR)/epoll_nonblock_demo $(BINDIR)/epoll_starve_demo
 NET_TARGETS  := $(BINDIR)/echo_epoll $(BINDIR)/echo_epoll_mt $(BINDIR)/echo_io_uring \
-                $(BINDIR)/echo_io_uring_adv $(BINDIR)/reactor_server $(BINDIR)/bench_client
+                $(BINDIR)/echo_io_uring_adv \
+                $(BINDIR)/reactor_server $(BINDIR)/bench_client
+
+# echo_io_uring_modern 是「只面向新环境」的写法，依赖 liburing 较新的 API：
+#   direct accept / 稀疏固定文件表 / 批量取 CQE（liburing ≥ 2.6）
+# 老发行版（例如 Ubuntu 22.04 自带的 2.1）没有这些符号，硬编会**整个构建失败**。
+# 所以这里在解析阶段探一下头文件，缺符号就把它从目标列表里摘掉，并给出提示。
+URING_MODERN_OK := $(shell \
+  grep -q io_uring_prep_multishot_accept_direct /usr/include/liburing.h 2>/dev/null && \
+  grep -q io_uring_register_files_sparse          /usr/include/liburing.h 2>/dev/null && \
+  grep -q io_uring_peek_batch_cqe                 /usr/include/liburing.h 2>/dev/null \
+  && echo yes || echo no)
+
+ifeq ($(URING_MODERN_OK),yes)
+NET_TARGETS += $(BINDIR)/echo_io_uring_modern
+endif
 
 .PHONY: all disk net demos libco bench bench_demo bench_net bench_net_matrix \
         bench_disk_matrix check clean help
@@ -78,7 +93,8 @@ help:
 	@echo "  构建："
 	@echo "    make            编译全部"
 	@echo "    make disk       只编译磁盘 I/O 三版 (sync / libaio / io_uring)"
-	@echo "    make net        只编译网络 (echo_epoll / echo_epoll_mt / echo_io_uring[_adv] / reactor_server / bench_client)"
+	@echo "    make net        只编译网络 (echo_epoll / echo_epoll_mt / echo_io_uring[_adv|_modern] / reactor_server / bench_client)"
+	@echo "                    _modern 需要 liburing >= 2.6，老环境会自动跳过并提示"
 	@echo "    make demos      只编译 epoll O_NONBLOCK 验证 demo"
 	@echo "    make libco      编译 libco 与协程 bench（需先 clone 到 third_party/libco）"
 	@echo ""
@@ -127,6 +143,11 @@ $(BINDIR)/epoll_starve_demo: $(DISKDIR)/epoll_starve_demo.c | $(BINDIR)
 
 # ================= 网络 =================
 net: | $(BINDIR) $(NET_TARGETS)
+ifeq ($(URING_MODERN_OK),no)
+	@echo "  [跳过] echo_io_uring_modern：本机 liburing 缺少所需 API"
+	@echo "         （需要 direct accept / 稀疏固定文件表 / 批量取 CQE，liburing ≥ 2.6）"
+	@echo "         想编译它请升级 liburing；其余目标不受影响。"
+endif
 
 $(BINDIR)/echo_epoll: $(NETDIR)/echo_epoll.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $<
@@ -141,6 +162,15 @@ $(BINDIR)/echo_epoll_mt: $(NETDIR)/echo_epoll_mt.c | $(BINDIR)
 $(BINDIR)/echo_io_uring_adv: $(NETDIR)/echo_io_uring_adv.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)
 	@echo "  [OK] echo_io_uring_adv"
+
+# io_uring 现代版：只面向新内核（≥6.6）+ 新 liburing（≥2.6），没有任何兼容包袱。
+# 用上 multishot accept + direct file table + 提供缓冲区环 + SQPOLL + CQ 忙轮询，
+# 实测稳态系统调用为 0、吞吐约 2x epoll（详见文件头与 README「实验五」）。
+# 用法示例（SQPOLL 内核线程单独绑一个核）：
+#   ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
+$(BINDIR)/echo_io_uring_modern: $(NETDIR)/echo_io_uring_modern.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)
+	@echo "  [OK] echo_io_uring_modern"
 
 $(BINDIR)/echo_io_uring: $(NETDIR)/echo_io_uring.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(URING_LIB)

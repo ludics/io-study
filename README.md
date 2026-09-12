@@ -51,6 +51,7 @@ io-study/
 │   ├── echo_epoll_mt.c       多线程 Reactor（SO_REUSEPORT 分流，N worker 各自 epoll）
 │   ├── echo_io_uring.c       io_uring echo server（Proactor 基础版）
 │   ├── echo_io_uring_adv.c   io_uring 火力全开版（SQPOLL/缓冲区环/multishot/ZC）
+│   ├── echo_io_uring_modern.c io_uring 现代版（新内核专用写法，无兼容包袱，最快）
 │   ├── bench_client.cpp      多线程 C++ 压测客户端（无 GIL）
 │   ├── bench.py              Python 压测客户端（推荐；支持连接数/预热/延迟分位/JSON）
 │   └── strace_epoll实测.txt   epoll 处理 1 条消息的真实系统调用序列
@@ -92,7 +93,7 @@ io-study/
 | `make check` | 环境体检（等价于 `scripts/check_env.sh` 的核心项） |
 | `make bench` | 磁盘 I/O 三方对比 |
 | `make bench_demo` | epoll O_NONBLOCK 对比实验 |
-| `make net` | 编译网络部分（含 `echo_io_uring_adv`） |
+| `make net` | 编译网络部分（含 `echo_io_uring_adv` 与 `echo_io_uring_modern`） |
 | `make bench_net` | 网络 echo 对比（epoll vs io_uring，单场景） |
 | `make bench_disk_matrix` | 磁盘 I/O 多维度对比（队列深度 × 块大小 × O_DIRECT），产出 `results/*.md` + `.csv` |
 | `make bench_net_matrix` | 网络 I/O 多维度对比（服务端 × 连接数 × 消息大小 × TCP_NODELAY），产出 `results/*.md` + `.csv` |
@@ -333,7 +334,7 @@ python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 
 ---
 
-## 实验五：io_uring 的极限在哪（`echo_io_uring_adv`）
+## 实验五：io_uring 的极限在哪（`echo_io_uring_adv` / `echo_io_uring_modern`）
 
 基础版 io_uring（`echo_io_uring.c`）每条消息提交一次 SQE、立刻 `io_uring_enter` 一次，
 把 io_uring 最值钱的特性全浪费了，结果反而**慢于 epoll**（0.70x）。
@@ -428,9 +429,66 @@ RX 软中断**：自己发出去的回显，马上由同一个线程"收到"并�
 再叠加上「常驻 recv」带来的异步轮询，就形成了那 41.7% + 27.4% 的开销。
 **这两项加起来接近 70% 的 CPU，全花在"等与唤醒"上，而不是花在搬数据上。**
 
-> ⚠️ multishot recv / 提供缓冲区环 / 零拷贝需要**内核 ≥6.0**（实际全特性在 7.0 上验证通过）。
-> Ubuntu 22.04 可装 HWE 内核（`linux-generic-hwe-22.04`，6.8）解锁。
-> 代码里这些特性都写好了并且会在内核不支持时**自动降级**，升级内核即可直接用。
+
+### 现代版：把兼容包袱全部删掉（`echo_io_uring_modern`）
+
+上面那个 `adv` 版为了同一份代码能在 5.15（老 UAPI 头文件 + liburing 2.1）和新内核上
+都编得过，塞进了三样东西：手写的内核 ABI 常量、"内核不支持就降级"的分支、
+以及自己实现的缓冲区环入队函数。代价是代码又长又绕，读者很难看清 io_uring 该怎么用。
+
+`network/echo_io_uring_modern.c` 是一份**只面向新环境**（内核 ≥6.6 + liburing ≥2.6）的
+重写版，上面三样全部删掉，所有高级特性都用 liburing 现成的辅助函数：
+
+| 技术 | 用到的 API | 收益 |
+| --- | --- | --- |
+| SQPOLL + SQ_AFF | `io_uring_queue_init_params` + `sq_thread_cpu` | 提交路径 **0 系统调用** |
+| CQ 忙轮询 | `io_uring_peek_batch_cqe` + `io_uring_cq_advance` | 收割路径 **0 系统调用** |
+| multishot accept + 固定文件表 | `io_uring_prep_multishot_accept_direct` + `io_uring_register_files_sparse` | 连接建立 **0 系统调用**，收发免 fget/fput |
+| 提供缓冲区环 | `io_uring_register_buf_ring` + `io_uring_buf_ring_add/advance` | 内存 O(连接数) → O(缓冲数) |
+| multishot recv | `io_uring_prep_recv_multishot` | 每条连接只提交一次 recv |
+| 零拷贝发送 | `io_uring_prep_send_zc` | 省一次拷贝（**但默认关着，见下**）|
+
+```bash
+make net
+# SQPOLL 的内核线程是忙轮询的，必须给它一个独立的核：
+ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
+```
+
+**实测（Ubuntu 26.04 / 内核 7.0，16 线程 × 256B，各配置交替 5 轮取中位）**：
+
+| 服务端 | 核数 | QPS | 相对 epoll |
+| --- | --- | --- | --- |
+| epoll 单线程 | 1 | 112k | 1.00x |
+| adv 全特性 + 忙轮询（开零拷贝） | 2 | 185k | 1.65x |
+| modern 全特性（开零拷贝） | 2 | 175k | 1.56x |
+| **modern 全特性（关零拷贝）** | 2 | **233k** | **2.08x** |
+
+**稳态系统调用数实测 0**（`perf stat -e syscalls:sys_enter_io_uring_enter`）：
+
+| 配置 | enter 次数 | 每条消息 |
+| --- | --- | --- |
+| 全特性（SQPOLL + 忙轮询） | **0** | **0.000** |
+| 关掉忙轮询 | 48,574 | 0.14 |
+| 关掉两者 | 243,478 | 1.02 |
+
+三个反直觉的结论（都用另一份独立实现交叉验证过）：
+
+1. **零拷贝在小消息下是负收益**：同一个二进制只改 `ECHO_ZC`，233k → 175k（**-26%**）。
+   `SEND_ZC` 每次发送会产生**两个** CQE（第二个带 `IORING_CQE_F_NOTIF`），
+   256B 消息省下的那次拷贝根本不值这个开销。所以现代版**默认关闭**它
+   （`ECHO_ZC=1` 可打开验证）。**「零拷贝」不是免费的午餐 —— 只有拷贝本身成为瓶颈时才划算。**
+2. **固定文件表 / direct accept 在这个量级没有可测量的收益**：`ECHO_FIXED=1` vs `0`
+   各跑 7 轮，中位数都是 222k。理论收益（省 fget/fput、免 accept 系统调用）在
+   这个并发量下不是瓶颈。保留它是因为它是现代写法且不额外花代价；
+   要到几万连接、fd 表很大时才可能显出价值。
+3. **`COOP_TASKRUN` / `DEFER_TASKRUN` 与 `SQPOLL` 互斥**（实测一起写内核返回 `EINVAL`），
+   但 `SINGLE_ISSUER` 可以和 SQPOLL 共存。想要 SQPOLL 就得放弃前两个。
+
+> 顺便回答一个常见疑问：**「少用系统调用」和「更高的吞吐」不是一回事**。
+> 本项目的对照实验里，把每条消息的系统调用从 1.02 次降到 0 次，吞吐是 72k → 233k；
+> 而 adv 版把系统调用从 2.01 降到 0.95 时吞吐几乎没动。差别在于**省掉的是哪一次**：
+> 省掉"等待完成"（收割）才会真的快，因为那一次进内核意味着进程要睡下去再被唤醒。
+
 
 ---
 

@@ -317,6 +317,7 @@ def _impl_paths() -> dict:
         "epoll_mt": BIN / "echo_epoll_mt",
         "uring": BIN / "echo_io_uring",
         "uring_adv": BIN / "echo_io_uring_adv",
+        "uring_modern": BIN / "echo_io_uring_modern",
         "libco": first_existing(LIBCO_DIR / "build/bin/example_echosvr",
                                 LIBCO_DIR / "example_echosvr"),
     }
@@ -327,17 +328,21 @@ def _nodelay_xlabel(x: int) -> str:
 
 
 def make_net_impls() -> list[Impl]:
-    """声明式地描述 5 种服务端。
+    """声明式地描述 6 种服务端。
 
-    注意两点：
+    注意三点：
       * libco 的示例 echo server 不支持 TCP_NODELAY 开关，所以它不参与
         「TCP_NODELAY」维度（否则会产出两条几乎相同的数据，误导读者）。
-      * uring_adv 是 io_uring 的「火力全开」形态（SQPOLL + 提供缓冲区环 +
+      * uring_adv 是 io_uring 的「火力全开」版本（SQPOLL + 提供缓冲区环 +
         multishot recv/accept + 零拷贝 + CQ 忙轮询）。它的各个特性本身也能
         用环境变量单独开关，这里固定成"全开"参与对比；要做归因实验请直接
         跑 network/echo_io_uring_adv.c 里列出的那些环境变量组合。
         注意它的 SQPOLL 会额外吃一个核：如果机器核数少，请相应调小
         CLIENT_THREADS，否则压测端和服务端会互相抢核。
+      * uring_modern 是只面向新内核/新 liburing 的现代写法，默认值就是实测最优
+        （SQPOLL + 忙轮询 + multishot accept/direct + 提供缓冲区环，零拷贝关闭）。
+        它同样需要 SQPOLL 内核线程有个独立的核可用，核少时同理要调小
+        CLIENT_THREADS。若在矩阵里看到它没跑赢，先怀疑是抢核而不是代码。
     """
 
     def argv_plain(binary: Path):
@@ -366,6 +371,10 @@ def make_net_impls() -> list[Impl]:
              lambda: p["uring_adv"], argv_plain,
              env={"ECHO_SQPOLL": "1", "ECHO_PBUF": "1", "ECHO_MULTISHOT": "1",
                   "ECHO_ZC": "1", "ECHO_SPIN": "1"}),
+        Impl("uring_modern", "io_uring 现代版 (SQPOLL+direct accept+缓冲环+忙轮询)",
+             lambda: p["uring_modern"], argv_plain,
+             # 默认值已经是实测最优（零拷贝关），所以这里不需要额外环境变量
+             env={}),
         Impl("libco", "libco (协程)", lambda: p["libco"], argv_libco),
     ]
 
