@@ -440,6 +440,60 @@ strace -c -f -e trace=epoll_pwait,epoll_wait,epoll_ctl,accept,read,write \
 > 会一条都抓不到（我第一遍就踩了这个坑，统计出来的 epoll 只有 4007 次，少了两千次）。
 > x86_64 上才叫 `epoll_wait`。写 strace 过滤器时两个都带上最稳。
 
+### 3.7 io_uring 的高级特性：极限在哪（`echo_io_uring_adv`）
+
+上面的结论是「基础版 io_uring 打不过 epoll」。但基础版每条消息只提交 1 个 SQE、
+立刻 `io_uring_enter` 一次，把 io_uring 值钱的特性全浪费了。
+`network/echo_io_uring_adv.c` 把高级特性都实现了，**每个都能用环境变量独立开关**，
+方便做归因：
+
+```bash
+make net
+ECHO_SQPOLL=1 ECHO_PBUF=1 ECHO_MULTISHOT=1 ECHO_ZC=1 ECHO_SPIN=1 \
+    ./bin/echo_io_uring_adv 19002      # 启动时打印「能力自检」表
+```
+
+| 环境变量 | 特性 | 内核要求 |
+|---|---|---|
+| `ECHO_SQPOLL` | 内核线程轮询 SQ，提交不进内核 | ≥5.1（非特权 ≥5.13） |
+| `ECHO_PBUF` | 提供缓冲区环，缓冲区由内核自取 | ≥5.19 |
+| `ECHO_MULTISHOT` | multishot recv（**是 flag 不是 opcode**） | ≥5.19 |
+| `ECHO_ZC` | 零拷贝发送（两个 CQE，要等 `IORING_CQE_F_NOTIF`） | ≥6.0 |
+| `ECHO_SPIN` | CQ 忙轮询，收割也不进内核 | 无 |
+| `ECHO_RECV_LATE` | 改成「发完再挂 recv」（诊断用，见下） | 无 |
+
+**实测（Ubuntu 26.04 / 内核 7.0，全部特性可用；16 线程 × 256B，客户端绑核 0-3）**：
+
+| 服务端 | 核数 | QPS |
+|---|---|---|
+| epoll 单线程 | 1 | 107k / 110k |
+| io_uring 基础版 | 1 | 74.7k ×3 |
+| adv 全特性（SQPOLL+缓冲环+multishot+ZC） | 2 | 63.4k ×3 |
+| **adv 全特性 + CQ 忙轮询** | 2 | **189.0k / 189.4k / 185.0k** |
+
+**189k vs 107k = 1.77 倍**，这是项目里 io_uring 第一次明确赢过 epoll。三条要点：
+
+1. **SQPOLL 单独用会更慢**（63k < 74.7k）：内核轮询线程占一个核，而收割仍要进内核。
+   **必须配 CQ 忙轮询**才见效 —— 一加就是 3.0x。
+   「什么时候 io_uring 有优势」的准确答案是：**提交和收割两条进内核的路径都被消掉时**。
+2. **SQPOLL 必须独占一个核**：同一个二进制，服务端绑 1 个核只有 15.4k，给 2 个核 63k。
+   把进程 `taskset` 到单核会让 SQ 内核线程和它抢同一个核，比不开还慢 —— 这是部署形态问题。
+3. **「什么时候挂下一条 recv」差 1.55x**：`ECHO_RECV_LATE=0`（默认，收到就续挂）38.9k，
+   `ECHO_RECV_LATE=1`（等回显发完再挂，即基础版形态）61.9k。
+   原因是回环下「发完再挂」时对端回复常已在 socket 缓冲区里，recv 能在提交时**立即完成**；
+   而「常驻可读」时 recv 往往要登记**异步轮询**，等数据到了再唤醒进程重新提交。
+   perf 采样显示这类开销占了近 70% 的 CPU（`__wake_up_sync_key` 41.7% +
+   `queued_spin_lock_slowpath` 27.4%）。注意这是**回环环境放大的效应**，
+   真实网络下常驻 recv 才是低延迟的正确姿势。
+
+> ⚠️ 这些特性需要**内核 ≥6.0**（全特性在 7.0 上验证通过）。Ubuntu 22.04 可装
+> `linux-generic-hwe-22.04`（6.8）解锁。代码会在内核不支持时**自动降级**并说明原因。
+
+> 🔧 **perf 用法**：虚拟机里通常没有 PMU（`cycles` 会报 not supported），
+> 改用软件事件采样：`sudo perf record -e cpu-clock -F 3000 --call-graph fp -p <PID> -- sleep 6`，
+> 再用 `sudo perf report --stdio --percent-limit 1` 看热点。
+> 建议先用 `-g -fno-omit-frame-pointer` 重编译，否则看不到调用栈。
+
 ---
 
 ## 第 4 步：epoll 为什么必须 O_NONBLOCK（实验验证）

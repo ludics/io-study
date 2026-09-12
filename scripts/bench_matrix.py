@@ -183,6 +183,11 @@ class Impl:
     # （libco 有 build/bin/ 和根目录两种布局）
     make_runner: Callable | None = None
     xlabel: Callable | None = None  # 扫描值怎么显示（比如 nodelay 的 0/1）
+    # 启动这个实现时要额外设置的环境变量。
+    # 典型用途是 echo_io_uring_adv 那类「一堆特性用环境变量开关」的服务端：
+    # 在这里写死一组开关，就等于把它固定成"全特性"这一种形态参与对比，
+    # 不必为每种开关组合都写一个新 Impl。
+    env: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +316,7 @@ def _impl_paths() -> dict:
         "epoll": BIN / "echo_epoll",
         "epoll_mt": BIN / "echo_epoll_mt",
         "uring": BIN / "echo_io_uring",
+        "uring_adv": BIN / "echo_io_uring_adv",
         "libco": first_existing(LIBCO_DIR / "build/bin/example_echosvr",
                                 LIBCO_DIR / "example_echosvr"),
     }
@@ -321,10 +327,17 @@ def _nodelay_xlabel(x: int) -> str:
 
 
 def make_net_impls() -> list[Impl]:
-    """声明式地描述 4 种服务端。
+    """声明式地描述 5 种服务端。
 
-    注意 libco 的示例 echo server 不支持 TCP_NODELAY 开关，所以它不参与
-    「TCP_NODELAY」维度（否则会产出两条几乎相同的数据，误导读者）。
+    注意两点：
+      * libco 的示例 echo server 不支持 TCP_NODELAY 开关，所以它不参与
+        「TCP_NODELAY」维度（否则会产出两条几乎相同的数据，误导读者）。
+      * uring_adv 是 io_uring 的「火力全开」形态（SQPOLL + 提供缓冲区环 +
+        multishot recv/accept + 零拷贝 + CQ 忙轮询）。它的各个特性本身也能
+        用环境变量单独开关，这里固定成"全开"参与对比；要做归因实验请直接
+        跑 network/echo_io_uring_adv.c 里列出的那些环境变量组合。
+        注意它的 SQPOLL 会额外吃一个核：如果机器核数少，请相应调小
+        CLIENT_THREADS，否则压测端和服务端会互相抢核。
     """
 
     def argv_plain(binary: Path):
@@ -349,6 +362,10 @@ def make_net_impls() -> list[Impl]:
         Impl("epoll", "epoll 单线程 (Reactor)", lambda: p["epoll"], argv_plain),
         Impl("epoll_mt", "epoll 多线程 (多 Reactor)", lambda: p["epoll_mt"], argv_plain),
         Impl("uring", "io_uring (Proactor)", lambda: p["uring"], argv_plain),
+        Impl("uring_adv", "io_uring 全特性 (SQPOLL+缓冲环+multishot+ZC+忙轮询)",
+             lambda: p["uring_adv"], argv_plain,
+             env={"ECHO_SQPOLL": "1", "ECHO_PBUF": "1", "ECHO_MULTISHOT": "1",
+                  "ECHO_ZC": "1", "ECHO_SPIN": "1"}),
         Impl("libco", "libco (协程)", lambda: p["libco"], argv_libco),
     ]
 
@@ -509,7 +526,12 @@ def run_net(args) -> int:
                 runner = impl.make_runner(Path(path))
                 argv = runner(port, {"mt_workers": args.mt_workers})
 
-                child = ChildProc(argv, srv_log, env={"ECHO_NODELAY": str(nodelay)})
+                # NODELAY 维度要求所有服务端都认这个开关；实现自带的固定环境变量
+                # （比如 uring_adv 的 SQPOLL/PBUF 那一组）在这里合并进去。
+                srv_env = {"ECHO_NODELAY": str(nodelay)}
+                if impl.env:
+                    srv_env.update(impl.env)
+                child = ChildProc(argv, srv_log, env=srv_env)
                 try:
                     if not wait_tcp_ready(port):
                         log.write("  [%s] %s conns=%-4d size=%-5d -> 启动失败: %s"

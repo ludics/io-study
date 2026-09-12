@@ -44,8 +44,17 @@
 //   ECHO_MULTISHOT=1|0  默认 1   （依赖 ECHO_PBUF）
 //   ECHO_ZC=1|0         默认 0   （需要内核 ≥6.0，默认关）
 //   ECHO_SPIN=1|0       默认 0   （忙轮询 CQ 而不进内核等，烧一个核换延迟）
+//   ECHO_ACCEPT_MS=1|0  默认 1   （multishot accept；关掉可用于归因）
+//   ECHO_BATCH=1|0      默认 1   （1=批量提交；0=每个请求单独提交，用于对照）
+//   ECHO_RECV_LATE=1|0  默认 0   （1=等回显发完再挂下一条 recv，即基础版的形态）
 //   ECHO_BUFS=256       提供缓冲区的数量
 //   ECHO_BUFSIZE=4096   单块大小
+//
+// ── 一条容易踩的坑：SQPOLL 必须给它留一个核 ─────────────────────────────────
+//   SQPOLL 的内核线程是**忙轮询**的，会一直占着 CPU。如果把服务端进程
+//   `taskset` 到单个核，内核线程也会落在同一个核上，两者互相抢 —— 实测反而
+//   比不开 SQPOLL 更慢（15k vs 25k QPS）。给它两个核（应用一个、SQ 线程一个）
+//   才看得到收益（44k vs 29k）。这不是代码问题，是部署形态问题。
 //
 // 用法：./bin/echo_io_uring_adv [port]
 // 测试：printf 'hello' | nc 127.0.0.1 [port]
@@ -69,8 +78,10 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
-// liburing 2.1 没有导出 io_uring_register() 这个符号，所以这里直接用系统调用。
-// 参数顺序与内核一致：io_uring_register(ring_fd, opcode, arg, nr_args)
+// 直接走系统调用注册缓冲区环，而不用 liburing 的 io_uring_register()：
+// 原因是 liburing 2.1（Ubuntu 22.04 自带）**没有导出这个符号**，
+// 用系统调用可以同时兼容新旧 liburing，避免为了一个调用去升级依赖。
+// 参数顺序与内核一致：io_uring_register(ring_fd, opcode, arg, nr_args)。
 #ifndef __NR_io_uring_register
 #define __NR_io_uring_register 427 /* x86_64 / aarch64 相同（asm-generic 表） */
 #endif
@@ -87,11 +98,20 @@ static int uring_register(int ring_fd, unsigned opcode, const void *arg, unsigne
 // （include/uapi/linux/io_uring.h），是**稳定的 ABI 常量，不会随版本变化**，
 // 因此在这里补齐是安全的。
 //
-// 注意：定义齐了不代表内核支持 —— 内核不支持时会返回 -EINVAL/-ENOSYS，
+// 【易错】写这种「向后兼容补丁」时，必须判断头文件里是不是**已经有了**，
+// 否则在较新的发行版（如 Ubuntu 26.04，头文件已含全部定义）上会直接编译失败：
+//   error: redefinition of struct or union 'struct io_uring_buf_ring'
+// 标量的判断很简单（enum 常量不是宏，用 #ifndef 一定成立，值又和内核一致，
+// 所以补了也不冲突）；但**结构体不能这么干**，必须找个可靠的宏来判定。
+// 这里用 IORING_OFF_PBUF_RING：它和 buf ring 那三个结构体是同一个内核补丁系列
+// （5.19）加进来的，存在它就说明头文件已经自带结构体。
+// 注意别拿 IOU_PBUF_RING_MMAP 判定 —— 它是 enum 常量不是宏，#ifdef 看不到它。
+//
+// 结论：定义齐了不代表内核支持 —— 内核不支持时会返回 -EINVAL/-ENOSYS，
 // 我们在运行时捕获并自动降级（见 capability_check / degrade_*）。
 // ---------------------------------------------------------------------------
 #ifndef IORING_REGISTER_PBUF_RING
-#define IORING_REGISTER_PBUF_RING 22 /* 内核 5.19 */
+#define IORING_REGISTER_PBUF_RING 22 /* 内核 5.19；新版头文件里是 enum，值相同 */
 #endif
 #ifndef IORING_RECV_MULTISHOT
 #define IORING_RECV_MULTISHOT (1U << 1) /* 内核 5.19；注意它是个 flag，不是 opcode */
@@ -107,7 +127,10 @@ static int uring_register(int ring_fd, unsigned opcode, const void *arg, unsigne
 #endif
 
 // 提供缓冲区的三个结构体（内核 5.19）。字段顺序必须与内核一致，不能改。
-#ifndef __IO_URING_BUF_DEFINED
+#ifdef IORING_OFF_PBUF_RING
+// 头文件 ≥ 5.19 时已经自带这三个结构体，直接用系统头文件的定义。
+// （同一个类型定义两遍会编译失败，所以这里必须跳过。）
+#else
 struct io_uring_buf {
     __u64 addr; /* 数据缓冲区地址 */
     __u32 len;  /* 这块缓冲区能装多少字节 */
@@ -136,8 +159,7 @@ struct io_uring_buf_reg {
     __u16 flags;       /* IOU_PBUF_RING_MMAP 等 */
     __u64 resv[3];
 };
-#define __IO_URING_BUF_DEFINED
-#endif
+#endif /* IORING_OFF_PBUF_RING */
 
 // ---------------------------------------------------------------------------
 // 配置与全局状态
@@ -170,6 +192,9 @@ static int g_use_pbuf = 1;
 static int g_use_multishot = 1;
 static int g_use_zc = 0;
 static int g_use_spin = 0;
+static int g_use_accept_ms = 1;  // multishot accept（诊断用开关，见文件头说明）
+static int g_batch = 1;          // 1=批量提交（默认）0=每准备一个 SQE 就提交一次（诊断用）
+static int g_recv_late = 0;      // 1=等 send 完成后再挂下一条 recv（诊断用，见 handle_cqe）
 
 static int g_bufcount = 256;
 static int g_bufsize = 4096;
@@ -184,10 +209,20 @@ static int g_bufs_free = 0;            // 当前可被内核取用的缓冲区�
 enum { BUF_KERNEL = 0, BUF_APP = 1 };  // 内核持有 / 应用持有（回显中或待归还）
 
 // 连接表（下标即 fd）
+//
+// 关掉提供缓冲区环时，每条连接需要**自己**的接收缓冲区。这里给了两块并轮流用，
+// 原因是：一条消息被回显出去时，我们必须同时为「下一次 recv」准备缓冲区；
+// 如果两者用同一块（初版就是这样写的），下一次 recv 就会覆盖正在发送中的数据 ——
+// 单条 ping-pong 下看不出来（客户端在收到回显前不会发下一条），
+// 但只要客户端流水线化（连发两条），数据就会被写坏。
+// 两块轮换可以覆盖「在途 send ≤ 1」的场景，也是这类 fallback 最省事的正确写法。
+#define RXBUF_SLOTS 2
+
 static struct conn_state {
     int in_use;
     int recv_active;   // 是否已有一个 recv 在飞（单次模式下避免重复提交）
-    char *rxbuf;       // 关闭提供缓冲区时，每条连接自己的固定接收缓冲区
+    int rx_idx;        // 当前该用哪一块接收缓冲区（与回显中的那块错开）
+    char *rxbuf[RXBUF_SLOTS];
 } g_conns[MAX_CONNS];
 
 static long g_stat_recv = 0, g_stat_send = 0, g_stat_err = 0;
@@ -240,19 +275,59 @@ static void pbuf_return(unsigned bid) {
 // 提交请求
 // ---------------------------------------------------------------------------
 
+// 清零一个 SQE。
+//
+// 【为什么单包一个小函数】提交前必须清零 SQE —— SQ 环里的槽位是循环复用的，
+// 上一次请求残留的字段会污染这一次（典型症状：莫名多出 IOSQE_BUFFER_SELECT、
+// 或者 addr/len 还是上一笔的旧值）。直觉写法是 memset(sqe, 0, sizeof(*sqe))，
+// 但 liburing 的 SQ 环是**运行期 mmap 出来的内存**，GCC 在 -O2 下把
+// io_uring_get_sqe() 内联之后会静态推断"目标对象大小为 0"，于是报一个误警：
+//     warning: '__builtin_memset' offset [0, 62] is out of the bounds [0, 0]
+// 把指针先转成 void* 会切断这层推断，语义完全不变（都是把这 64 字节清零）。
+static void sqe_zero(struct io_uring_sqe *sqe) {
+    if (!sqe) return;
+    memset((void *)sqe, 0, sizeof(*sqe));
+}
+
+// 提交形态开关（ECHO_BATCH，诊断用）。
+//
+//   批量模式（默认，ECHO_BATCH=1）：
+//       这里只把 SQE 填进 SQ 环，不立刻进内核；等本轮 CQE 都处理完，
+//       由事件循环统一 io_uring_submit() 一次 —— 一次 io_uring_enter 提交多个请求，
+//       这正是 io_uring 相对 epoll 的核心优势（epoll 每次都要单独 read/write）。
+//   逐条模式（ECHO_BATCH=0）：
+//       每填一个 SQE 就立刻提交一次，用来做「批量 vs 逐条」的对照实验。
+//
+// 实测差别（本机 16 客户端线程 / 256B ping-pong，服务端单核）：
+//       逐条：每条消息 2.01 次 io_uring_enter
+//       批量：每条消息 0.95 次 io_uring_enter     ← 少了一半
+static void maybe_flush(void) {
+    if (!g_batch) io_uring_submit(&g_ring);
+}
+
 // 提交一个 accept。若内核支持 multishot accept，一次提交就能持续接受新连接。
 static void submit_accept(void) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return;
-    memset(sqe, 0, sizeof(*sqe));
+    sqe_zero(sqe);
     sqe->opcode = IORING_OP_ACCEPT;
     sqe->fd = g_listen_fd;
     sqe->addr = 0;
     sqe->addr2 = 0;
     // multishot accept：一次提交，之后每个新连接都产生一个 CQE（带 IORING_CQE_F_MORE）。
     // 内核 < 5.19 不支持这个 flag，会直接返回 -EINVAL，我们在完成路径里降级。
-    sqe->ioprio |= IORING_ACCEPT_MULTISHOT;
+    if (g_use_accept_ms) sqe->ioprio |= IORING_ACCEPT_MULTISHOT;
     sqe->user_data = PACK(0, OP_ACCEPT, 0);
+    maybe_flush();
+}
+
+// 取一块「当前可用来接收」的缓冲区（仅非提供缓冲区模式用）。
+// 用完一块就换另一块，保证正在回显的那块不会被下一次 recv 覆盖。
+static char *rxbuf_for(int fd) {
+    struct conn_state *cs = &g_conns[fd];
+    char **slot = &cs->rxbuf[cs->rx_idx];
+    if (!*slot) *slot = malloc(g_bufsize);
+    return *slot;
 }
 
 // 为一条连接提交 recv。
@@ -261,7 +336,7 @@ static void submit_accept(void) {
 static void submit_recv(int fd) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return;
-    memset(sqe, 0, sizeof(*sqe));
+    sqe_zero(sqe);
     sqe->opcode = IORING_OP_RECV;
     sqe->fd = fd;
     sqe->user_data = PACK(fd, OP_RECV, 0);
@@ -276,23 +351,25 @@ static void submit_recv(int fd) {
             sqe->ioprio |= IORING_RECV_MULTISHOT;
         }
     } else {
-        // 没有提供缓冲区时只能自己指定地址：退化成"每条连接一块固定内存"。
-        // 注意必须在连接状态里记住这块内存 —— 完成时要靠它找到回显数据。
-        if (fd < MAX_CONNS && !g_conns[fd].rxbuf) {
-            g_conns[fd].rxbuf = malloc(g_bufsize);
-        }
-        if (fd >= MAX_CONNS || !g_conns[fd].rxbuf) { g_stat_err++; return; }
-        sqe->addr = (unsigned long)g_conns[fd].rxbuf;
+        // 没有提供缓冲区时只能自己指定地址：退化成"每条连接两块固定内存，轮流用"。
+        // 必须在连接状态里记住这块内存 —— 完成时要靠它找到回显数据。
+        if (fd < 0 || fd >= MAX_CONNS) { g_stat_err++; return; }
+        char *buf = rxbuf_for(fd);
+        if (!buf) { g_stat_err++; return; }
+        sqe->addr = (unsigned long)buf;
         sqe->len = g_bufsize;
+        // 这块缓冲区即将被内核写入，下一次 recv 要换用另一块
+        g_conns[fd].rx_idx ^= 1;
     }
     if (fd < MAX_CONNS) g_conns[fd].recv_active = 1;
+    maybe_flush();
 }
 
 // 提交回显。地址/长度来自那个被内核选中的缓冲区。
 static void submit_send(int fd, void *data, unsigned len, unsigned bid) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return;
-    memset(sqe, 0, sizeof(*sqe));
+    sqe_zero(sqe);
     sqe->fd = fd;
     sqe->addr = (unsigned long)data;
     sqe->len = len;
@@ -306,6 +383,7 @@ static void submit_send(int fd, void *data, unsigned len, unsigned bid) {
     } else {
         sqe->opcode = IORING_OP_SEND;
     }
+    maybe_flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -343,12 +421,15 @@ static void capability_check(void) {
         printf(" multishot recv    : ❌ 不可用（依赖提供缓冲区环）\n");
     }
     printf(" multishot accept  : %s（需内核 ≥5.19）\n",
-           g_use_multishot ? "尝试启用" : "未启用");
+           g_use_accept_ms ? "✅ 已提交" : "➖ 未启用（ECHO_ACCEPT_MS=0）");
     printf(" zerocopy send     : %s\n",
            zc_ok ? (g_use_zc ? "✅ 已启用" : "可用但未启用（ECHO_ZC=0）")
                  : "❌ 内核不支持（需 ≥6.0）");
     printf(" CQ 忙轮询         : %s\n",
            g_use_spin ? "✅ 已启用（烧一核换延迟）" : "➖ 未启用");
+    printf(" 提交形态          : %s\n",
+           g_batch ? "✅ 批量（一轮 CQE 处理完统一提交一次）"
+                   : "逐条（每个请求单独提交，用于对照）");
     if (probe) io_uring_free_probe(probe);
     printf("==================================================\n");
     fflush(stdout);
@@ -362,7 +443,10 @@ static void close_conn(int fd) {
     if (fd >= 0 && fd < MAX_CONNS) {
         g_conns[fd].in_use = 0;
         g_conns[fd].recv_active = 0;
-        if (g_conns[fd].rxbuf) { free(g_conns[fd].rxbuf); g_conns[fd].rxbuf = NULL; }
+        g_conns[fd].rx_idx = 0;
+        for (int i = 0; i < RXBUF_SLOTS; i++) {
+            if (g_conns[fd].rxbuf[i]) { free(g_conns[fd].rxbuf[i]); g_conns[fd].rxbuf[i] = NULL; }
+        }
     }
     close(fd);
 }
@@ -394,7 +478,7 @@ static void handle_cqe(struct io_uring_cqe *cqe) {
             }
             struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
             if (sqe) {
-                memset(sqe, 0, sizeof(*sqe));
+                sqe_zero(sqe);
                 sqe->opcode = IORING_OP_ACCEPT;
                 sqe->fd = g_listen_fd;
                 sqe->user_data = PACK(0, OP_ACCEPT, 0);
@@ -421,8 +505,10 @@ static void handle_cqe(struct io_uring_cqe *cqe) {
                     g_bufs_free--;
                 }
             } else if (fd < MAX_CONNS) {
-                // 没走缓冲区选择：数据收在连接自己的固定缓冲区里
-                data = g_conns[fd].rxbuf;
+                // 没走缓冲区选择：数据收在连接自己的那两块固定缓冲区之一里。
+                // 注意 submit_recv() 在提交时已经把 rx_idx 翻到了下一块，
+                // 所以这里拿到的正好是「刚收完、且不会被下一次 recv 覆盖」的那块。
+                data = g_conns[fd].rxbuf[g_conns[fd].rx_idx ^ 1];
                 bid = 0;
             }
             g_stat_recv++;
@@ -434,13 +520,14 @@ static void handle_cqe(struct io_uring_cqe *cqe) {
             }
 
             // multishot：有 F_MORE 就说明这次 recv 还在继续，不用重新提交
-            if (!(flags & IORING_CQE_F_MORE)) {
+            if (!(flags & IORING_CQE_F_MORE) && !g_recv_late) {
                 if (g_use_multishot && !g_multishot_warned) {
                     // 走到这里通常是内核不支持 multishot（返回 -EINVAL 后我们降级重试）
                     g_multishot_warned = 1;
                 }
                 submit_recv(fd);
             }
+            // g_recv_late=1 时故意不在这里挂 recv，改由 send 完成事件来挂（见文件头 ECHO_RECV_LATE）
         } else if (res == -EINVAL || res == -EOPNOTSUPP) {
             // 内核不支持 multishot recv（需 ≥5.19）→ 关掉它重来一次
             if (g_use_multishot && !g_multishot_warned) {
@@ -487,6 +574,12 @@ static void handle_cqe(struct io_uring_cqe *cqe) {
         if (g_buf_ring && (!g_use_zc || (flags & IORING_CQE_F_NOTIF))) {
             pbuf_return(bid);
         }
+        // ECHO_RECV_LATE=1：等这一条回显真正发完，才去挂下一条 recv。
+        // 这是基础版 echo_io_uring.c 的形态 —— 用它做对照，可以量化
+        // 「常驻 recv（一收到就续挂）」与「发完再挂」的差别。
+        // 注意 multishot 模式下 recv 是常驻的（F_MORE 一直在），这里不能再挂，
+        // 否则会挂出两条在飞的 recv。
+        if (g_recv_late && !g_use_multishot) submit_recv(fd);
     }
 }
 
@@ -501,6 +594,9 @@ int main(int argc, char *argv[]) {
     g_use_multishot = (int)env_flag("ECHO_MULTISHOT", 1);
     g_use_zc        = (int)env_flag("ECHO_ZC", 0);
     g_use_spin      = (int)env_flag("ECHO_SPIN", 0);
+    g_use_accept_ms = (int)env_flag("ECHO_ACCEPT_MS", 1);
+    g_batch         = (int)env_flag("ECHO_BATCH", 1);
+    g_recv_late     = (int)env_flag("ECHO_RECV_LATE", 0);
     g_bufcount      = (int)env_flag("ECHO_BUFS", 256);
     g_bufsize       = (int)env_flag("ECHO_BUFSIZE", 4096);
     if (g_bufcount > MAX_BUFS) g_bufcount = MAX_BUFS;
@@ -588,15 +684,16 @@ int main(int argc, char *argv[]) {
 
     // ---- 起手：提交监听与 accept ----
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
-    memset(sqe, 0, sizeof(*sqe));
+    sqe_zero(sqe);
     sqe->opcode = IORING_OP_ACCEPT;
     sqe->fd = g_listen_fd;
     sqe->ioprio |= IORING_ACCEPT_MULTISHOT;
     sqe->user_data = PACK(0, OP_ACCEPT, 0);
     io_uring_submit(&g_ring);
 
-    printf("[adv] 监听 %d（SQPOLL=%d PBUF=%d MULTISHOT=%d ZC=%d SPIN=%d）\n",
-           g_port, g_use_sqpoll, g_use_pbuf, g_use_multishot, g_use_zc, g_use_spin);
+    printf("[adv] 监听 %d（SQPOLL=%d PBUF=%d MULTISHOT=%d ZC=%d SPIN=%d ACCEPT_MS=%d BATCH=%d）\n",
+           g_port, g_use_sqpoll, g_use_pbuf, g_use_multishot, g_use_zc, g_use_spin,
+           g_use_accept_ms, g_batch);
     fflush(stdout);
 
     // ---- 事件循环 ----

@@ -336,46 +336,101 @@ python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 ## 实验五：io_uring 的极限在哪（`echo_io_uring_adv`）
 
 基础版 io_uring（`echo_io_uring.c`）每条消息提交一次 SQE、立刻 `io_uring_enter` 一次，
-把 io_uring 最值钱的特性全浪费了，结果反而略慢于 epoll。`network/echo_io_uring_adv.c`
-把四个高级特性都实现出来，**并且每个都能用环境变量独立开关**，这样可以量化各自贡献：
+把 io_uring 最值钱的特性全浪费了，结果反而**慢于 epoll**（0.70x）。
+`network/echo_io_uring_adv.c` 把高级特性都实现出来，**并且每个都能用环境变量独立开关**，
+这样可以量化各自的贡献：
 
-| 特性 | 作用 | 内核要求 | 本机(Ubuntu 22.04 / 5.15) |
-| --- | --- | --- | --- |
-| `IORING_SETUP_SQPOLL` | 内核线程轮询 SQ，**提交不进内核** | ≥5.1（非特权需 ≥5.13） | ✅ 可用 |
-| 提供缓冲区环 `IORING_REGISTER_PBUF_RING` | 缓冲区交给内核自取，内存 O(连接数)→O(缓冲数) | ≥5.19 | ❌ 不可用 |
-| `IORING_RECV_MULTISHOT` | 提交一次 recv 持续收割（**注意：是 flag 不是 opcode**） | ≥5.19 | ❌ 不可用 |
-| `IORING_OP_SEND_ZC` | 零拷贝发送（会返回两个 CQE，要等 `IORING_CQE_F_NOTIF`） | ≥6.0 | ❌ 不可用 |
+| 特性 | 作用 | 内核要求 | 5.15 | 7.0 |
+| --- | --- | --- | --- | --- |
+| `IORING_SETUP_SQPOLL` | 内核线程轮询 SQ，**提交不进内核** | ≥5.1（非特权需 ≥5.13） | ✅ | ✅ |
+| 提供缓冲区环 `IORING_REGISTER_PBUF_RING` | 缓冲区交给内核自取，内存 O(连接数)→O(缓冲数) | ≥5.19 | ❌ | ✅ |
+| `IORING_RECV_MULTISHOT` | 提交一次 recv 持续收割（**注意：是 flag 不是 opcode**） | ≥5.19 | ❌ | ✅ |
+| multishot accept `IORING_ACCEPT_MULTISHOT` | 一次提交持续接受新连接 | ≥5.19 | ❌ | ✅ |
+| `IORING_OP_SEND_ZC` | 零拷贝发送（返回两个 CQE，要等 `IORING_CQE_F_NOTIF`） | ≥6.0 | ❌ | ✅ |
 
 ```bash
 make net
-ECHO_SQPOLL=1 ./bin/echo_io_uring_adv 19002      # 启动时会打印「能力自检」表
+ECHO_SQPOLL=1 ./bin/echo_io_uring_adv 19002      # 启动时打印「能力自检」表
 ECHO_SPIN=1   ./bin/echo_io_uring_adv 19002      # 再加 CQ 忙轮询
 ```
 
-**实测一组**（16 客户端线程 × 256B，客户端绑核 0-3、服务端绑核 4）：
+### 全特性实测（Ubuntu 26.04 / 内核 7.0，所有特性都能跑）
 
-| 服务端 | QPS | 相对 epoll |
+16 客户端线程 × 256B ping-pong，客户端绑核 0-3，交替跑 3 轮：
+
+| 服务端 | 核数 | QPS（3 轮） |
 | --- | --- | --- |
-| epoll 单线程 | 118,841 | 1.00x |
-| io_uring 基础版 | 89,071 | 0.75x |
-| adv `SQPOLL=0` | 52,175 | 0.44x |
-| adv `SQPOLL=1` | **117,395** | 0.99x |
-| adv `SQPOLL=1` + CQ 忙轮询 | **149,313** | **1.26x** |
-| adv `SQPOLL=1` + CQ 忙轮询 + 4 核 | 150,989 | 1.27x |
+| epoll 单线程 | 1 | 107k, 110k |
+| io_uring 基础版 | 1 | 74.7k, 74.6k, 74.8k |
+| adv 全特性（SQPOLL+缓冲环+multishot+ZC） | 2 | 63.4k, 64.3k, 63.5k |
+| **adv 全特性 + CQ 忙轮询** | 2 | **189.0k, 189.4k, 185.0k** |
 
-三条结论：
+**全特性 + 忙轮询 = 189k，是 epoll 单线程（107k）的 1.77 倍**，而且只用了 1 个业务核
+（另 1 个核被 SQPOLL 内核线程占用）。这是项目里 io_uring 第一次明确超过 epoll。
 
-1. **SQPOLL 是决定性的**：同一个二进制，`SQPOLL=0 → 1` 从 52k 涨到 117k，**2.25x**。
-   这就是「提交不进内核」的价值。
-2. **CQ 忙轮询只在 SQPOLL 之上才有意义**：`SQPOLL=1` 时再 +27%（117k→149k）；
-   而 `SQPOLL=0` 时忙轮询毫无作用（52.2k vs 51.6k）—— 因为提交那一次系统调用还在，
-   只省收割没意义。**这直接回答了「什么时候 io_uring 才有优势」：当你能把
-   「提交」和「收割」的系统调用都消掉时。**
-3. **这是本项目里 io_uring 第一次超过 epoll**（149k vs 119k，1.26x）—— 而且才用了一个核。
+### 归因：到底是哪个特性在起作用
 
-> ⚠️ 想真正跑 multishot recv / 提供缓冲区环 / zerocopy send，需要**内核 ≥6.0**。
-> Ubuntu 22.04 可装 HWE 内核（`linux-generic-hwe-22.04`，6.8）来解锁。
-> 代码里这些特性都写好了并且会在内核不支持时**自动降级**，只要内核升级就能直接用。
+| 配置 | QPS | io_uring_enter / 条 |
+| --- | --- | --- |
+| io_uring 基础版 | 74.7k | 2.01 |
+| adv +SQPOLL +PBUF +MULTISHOT +ZC | 63.4k | 0.95 |
+| adv 同上 + CQ 忙轮询 | **189.0k** | ≈0 |
+
+四条结论：
+
+1. **批量提交能把系统调用减半**（2.01 → 0.95 次/条），但**吞吐几乎不动** ——
+   说明在这个场景里系统调用次数根本不是瓶颈，「省系统调用」本身不产生性能。
+2. **SQPOLL 单独用甚至会变慢**（63k < 74.7k）：内核轮询线程要吃掉一个核，
+   而应用仍要为「收割」进内核。**必须配上 CQ 忙轮询**（用 `io_uring_peek_cqe`
+   在用户态轮询 CQ，不进内核）才见效 —— 一加就是 **3.0x**。
+   > 所以「什么时候 io_uring 才有优势」的准确答案是：
+   > **当「提交」和「收割」两条进内核的路径都被消掉时**（SQPOLL + 忙轮询）。
+3. **SQPOLL 必须给它留一个核**：同一个二进制，服务端只绑 1 个核时 15.4k，
+   给 2 个核（应用 + SQ 线程各一个）63k。若把进程 `taskset` 到单核，
+   SQ 内核线程会落在同一个核上互相抢，**比不开 SQPOLL 还慢**。
+   这是部署形态问题，不是代码问题。
+4. **「什么时候挂下一条 recv」比想象中重要得多**（这条最容易漏）：
+   adv 默认在 recv 完成时立刻续挂下一条（保持 socket 常驻可读），
+   基础版则是**等回显真正发完才挂**。实测两者差 **1.55x**：
+   | 挂 recv 的时机 | QPS |
+   | --- | --- |
+   | 收到 recv 完成就续挂（常驻可读） | 38.9k, 39.4k |
+   | 等 send 完成后再挂（基础版形态） | 61.9k, 59.5k |
+   原因见下面的 perf 采样：回环下「发完再挂」时对端回复往往**已经在 socket 缓冲区里**，
+   recv 能在提交系统调用里直接完成；而「常驻可读」时 recv 十有八九要登记**异步轮询**，
+   等数据到了再唤醒进程重新提交 —— 省下的系统调用远抵不过唤醒的开销。
+   用 `ECHO_RECV_LATE=1` 可以切换这两种形态自己做对照。
+   > 注意：这不是说「常驻 recv」写法有问题。真实网络下对端回复要几十上百微秒才到，
+   > 常驻 recv 才是低延迟的正确姿势；这里的 1.55x 是回环（内核内同步投递）
+   > 这个特殊环境放大的效应。测出来的是「环境」而不是「写法」。
+
+### 怎么用 perf 定位到这些的（方法本身可复用）
+
+```bash
+# 1) 确认 perf 能用：虚拟机里通常没有 PMU，cycles/instructions 会报 not supported
+sudo perf stat -e cycles -- /bin/true
+# 2) 退而用软件事件采样（cpu-clock 靠时钟中断，不依赖 PMU）
+gcc -O2 -g -fno-omit-frame-pointer -o /tmp/adv_prof network/echo_io_uring_adv.c -luring
+sudo perf record -e cpu-clock -F 3000 --call-graph fp -p <服务端PID> -- sleep 6
+sudo perf report -i perf.data --stdio --no-collapse --percent-limit 1
+```
+
+采样结果（adv、SQPOLL=0、全关高级特性）：
+
+```
+41.7%  __wake_up_sync_key          ← 唤醒等待队列（异步轮询完事后的唤醒）
+27.4%  queued_spin_lock_slowpath   ← 等待队列哈希锁竞争
+52.8%  io_send → tcp_sendmsg → __dev_queue_xmit → __local_bh_enable_ip → do_softirq
+```
+
+`do_softirq` 出现在发送路径里，是因为**回环设备的发送会在发送方进程上下文里内联执行
+RX 软中断**：自己发出去的回显，马上由同一个线程"收到"并唤醒对端 socket。
+再叠加上「常驻 recv」带来的异步轮询，就形成了那 41.7% + 27.4% 的开销。
+**这两项加起来接近 70% 的 CPU，全花在"等与唤醒"上，而不是花在搬数据上。**
+
+> ⚠️ multishot recv / 提供缓冲区环 / 零拷贝需要**内核 ≥6.0**（实际全特性在 7.0 上验证通过）。
+> Ubuntu 22.04 可装 HWE 内核（`linux-generic-hwe-22.04`，6.8）解锁。
+> 代码里这些特性都写好了并且会在内核不支持时**自动降级**，升级内核即可直接用。
 
 ---
 
