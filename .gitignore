@@ -13,3 +13,7 @@ third_party/
 *.trace
 ep_trace.txt
 uring_trace.txt
+
+# Python 缓存（在虚拟机上跑 py_compile 会写进共享目录）
+__pycache__/
+*.pyc
