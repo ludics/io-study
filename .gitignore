@@ -1,0 +1,15 @@
+# 编译产物
+bin/
+*.o
+*.a
+results/
+
+# 第三方源码（按需 clone：git clone https://github.com/Tencent/libco third_party/libco）
+third_party/
+
+# 测试遗留文件
+/tmp/iodemo_testfile
+*.log
+*.trace
+ep_trace.txt
+uring_trace.txt

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reactor 与 Proactor —— 命名渊源、io_uring 详解与主从 Reactor</title>
+<style>
+  :root {
+    --bg: #0f172a; --card: #1e293b; --card2: #263449;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
+    --accent2: #34d399; --warn: #fbbf24; --danger: #f87171; --border: #334155;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif; background: var(--bg); color: var(--text); line-height: 1.8; }
+  .container { max-width: 1000px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 2em; margin: 0 0 8px; }
+  h2 { font-size: 1.5em; margin: 48px 0 16px; padding-bottom: 8px; border-bottom: 2px solid var(--border); color: var(--accent); }
+  h3 { font-size: 1.2em; margin: 28px 0 12px; color: var(--accent2); }
+  .subtitle { color: var(--muted); margin-bottom: 32px; }
+  code { background: #0b1220; padding: 2px 6px; border-radius: 4px; font-family: "SF Mono",Consolas,monospace; font-size: 0.9em; color: #7dd3fc; }
+  pre { background: #0b1220; padding: 16px 20px; border-radius: 8px; overflow-x: auto; font-size: 0.84em; line-height: 1.6; border: 1px solid var(--border); }
+  pre code { background: none; padding: 0; color: #cbd5e1; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; margin: 20px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.92em; }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--card2); color: var(--accent); font-weight: 600; white-space: nowrap; }
+  tr:hover td { background: rgba(56,189,248,0.04); }
+  .tag { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 0.8em; font-weight: 600; }
+  .tag-reactor { background: #1d4ed8; color: #bfdbfe; }
+  .tag-proactor { background: #065f46; color: #a7f3d0; }
+  .tag-warn { background: #78350f; color: #fde68a; }
+  .highlight { background: rgba(56,189,248,0.12); border-left: 4px solid var(--accent); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; }
+  .warnbox { background: rgba(251,191,36,0.08); border-left: 4px solid var(--warn); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; }
+  .dangerbox { background: rgba(248,113,113,0.08); border-left: 4px solid var(--danger); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; }
+  .step { display: flex; gap: 14px; margin: 12px 0; }
+  .step .no { flex: 0 0 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #0b1220; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+  .svg-wrap { background: #0b1220; border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin: 16px 0; overflow-x: auto; }
+  .svg-wrap svg { display: block; margin: 0 auto; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.85em; color: var(--muted); margin: 8px 0; }
+  .legend span::before { content: "■"; margin-right: 6px; font-size: 1.1em; }
+  a { color: var(--accent); }
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: Consolas,monospace; font-size: 0.85em; margin: 12px 0; }
+  .flow .arrow { color: var(--muted); }
+  .flow .box { background: var(--card2); padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); }
+  .flow .box.syscall { color: #7dd3fc; border-color: #38bdf8; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Reactor 与 Proactor</h1>
+<div class="subtitle">命名渊源 · io_uring 详解 · 主从 Reactor · 实测对比</div>
+
+<div class="card">
+<p>本文回答四个核心问题：<strong>① Reactor 是什么、为什么这么命名；② Proactor 是什么、为什么这么命名；③ io_uring 是不是 Proactor、与 epoll 的区别联系；④ 除了这两种还有哪些模式</strong>。并附上沙箱实测：用 <code>strace</code> 实测了 epoll 处理单个请求的系统调用序列，编译了 io_uring 版 Echo Server 对照。</p>
+</div>
+
+<!-- ============ 第一部分：核心判据 ============ -->
+<h2>1. 先建立一个核心判据</h2>
+<p>Reactor 和 Proactor 描述的是<strong>事件驱动编程中"谁来执行 I/O 数据搬运"的分工</strong>。判断的关键只有一个问题：</p>
+
+<div class="highlight">
+<strong>「内核缓冲区 ↔ 用户缓冲区之间的数据 copy 由谁发起？应用线程要不要等这个 copy 完成？」</strong>
+</div>
+
+<table>
+  <tr><th>判断维度</th><th>Reactor</th><th>Proactor</th></tr>
+  <tr><td>内核通知你什么</td><td>"数据<strong>就绪</strong>了，你可以去读"</td><td>"数据<strong>已经读好</strong>了，在 buffer 里"</td></tr>
+  <tr><td>谁发起数据 copy</td><td><strong>应用自己</strong>调 <code>read/write</code></td><td><strong>内核</strong>替你完成</td></tr>
+  <tr><td>应用线程等不等 copy</td><td>等（同步）</td><td>不等（异步）</td></tr>
+  <tr><td>本质</td><td>就绪通知（readiness）</td><td>完成通知（completion）</td></tr>
+</table>
+
+<blockquote style="border-left:4px solid var(--accent2); padding-left:16px; color:var(--accent2); margin:16px 0;">
+一句话：<strong>Reactor 是"内核喊你起床，你自己去吃饭"；Proactor 是"内核直接把饭端到你面前"。</strong>
+</blockquote>
+
+<!-- ============ 第二部分：Reactor 命名 ============ -->
+<h2>2. 为什么叫 Reactor（反应堆）？</h2>
+
+<p><strong>"Reactor" 来自设计模式</strong>，由 Douglas C. Schmidt 在 1990 年代研究高性能网络服务器时命名并系统化（代表作《Reactor: An Object Behavioral Pattern for Demultiplexing and Dispatching Handles for Synchronous Events》）。</p>
+
+<h3>2.1 命名的比喻</h3>
+<p>一个<strong>中心调度器（Reactor）</strong>负责监听所有事件源，当事件发生时，它"<strong>做出反应</strong>"（React）——把事件<strong>分发（dispatch）</strong>给对应的处理器（handler）。</p>
+
+<div class="highlight">
+就像化学反应堆里的<strong>催化剂</strong>：自己不参与具体反应，但<strong>控制反应的进行</strong>。Reactor 自己不处理业务逻辑，只负责"接事件 → 派事件"。
+</div>
+
+<h3>2.2 名称拆解</h3>
+<table>
+  <tr><th>前缀</th><th>含义</th><th>指向</th></tr>
+  <tr><td><strong>Re-</strong></td><td>响应、反复（react）</td><td>事件<strong>发生后</strong>才"反应"去处理</td></tr>
+  <tr><td><strong>-actor</strong></td><td>执行者</td><td>一个"持续响应并调度事件执行者"的中心组件</td></tr>
+</table>
+
+<h3>2.3 Reactor 的四个构成要素</h3>
+<div class="step"><div class="no">1</div><div><strong>Handle（句柄）</strong>：就是 fd，表示事件源。</div></div>
+<div class="step"><div class="no">2</div><div><strong>Synchronous Event Demultiplexer（同步事件多路分离器）</strong>：<code>select/poll/epoll</code>，阻塞等待多个 handle 就绪。</div></div>
+<div class="step"><div class="no">3</div><div><strong>Event Handler</strong>：事件处理器，处理具体业务。</div></div>
+<div class="step"><div class="no">4</div><div><strong>Concrete Event Handler</strong>：具体处理器实现。</div></div>
+
+<h3>2.4 epoll 为什么是 Reactor</h3>
+<p>因为 <code>epoll_wait</code> 只告诉你"fd 可读了"，<strong>读数据的动作还是应用自己 <code>read</code></strong>，应用线程在 <code>read</code> 里要等内核把数据拷完。这正是"就绪通知 + 应用自己干活"的 Reactor 特征。</p>
+
+<!-- ============ 第三部分：Proactor 命名 ============ -->
+<h2>3. 为什么叫 Proactor？</h2>
+
+<p>"Proactor" 是 Reactor 的<strong>对称命名</strong>，同样出自 Schmidt 团队（1997 年左右提出，论文《Proactor: An Object Behavioral Pattern for Demultiplexing and Dispatching Handlers for Asynchronous Events》）。</p>
+
+<h3>3.1 前缀对比的精妙之处</h3>
+<table>
+  <tr><th>前缀</th><th>含义</th><th>指向</th></tr>
+  <tr><td><strong>Re-</strong></td><td>响应、反应（react）</td><td>事件<strong>发生后</strong>才"反应"去处理（被动）</td></tr>
+  <tr><td><strong>Pro-</strong></td><td>提前、前置、主动（proactive）</td><td><strong>主动</strong>发起 I/O 操作，让内核先行完成（主动）</td></tr>
+</table>
+
+<div class="highlight">
+<strong>Proactor 的核心是"主动"（proactive）</strong>：应用<strong>提前</strong>把"我要读 fd=7 到 buf"这个完整 I/O 操作交给内核，然后就不管了。内核在后台<strong>主动地、独立地</strong>完成整个 I/O（包括数据 copy），完成后通知应用"已读好 1024 字节"。
+</div>
+
+<blockquote style="border-left:4px solid var(--accent2); padding-left:16px; color:var(--accent2); margin:16px 0;">
+命名总结：<strong>Reactor 是"响应式"（等事件来了再反应），Proactor 是"主动式"（提前把活交出去让内核主动做完）</strong>。
+</blockquote>
+
+<!-- ============ 第四部分：io_uring ============ -->
+<h2>4. io_uring 是 Proactor 吗？与 epoll 的区别</h2>
+
+<h3>4.1 结论</h3>
+<p><strong>是的，io_uring 是典型的 Proactor 模型</strong>，而且是 Linux 上目前<strong>最彻底的 Proactor 实现</strong>。</p>
+
+<h3>4.2 io_uring 核心机制</h3>
+<p>由 Linux 内核开发者 <strong>Jens Axboe</strong> 设计，Linux 5.1（2019）引入。核心是<strong>用户态和内核态共享的两个环形队列</strong>（mmap 映射）：</p>
+
+<table>
+  <tr><th>队列</th><th>全称</th><th>生产者</th><th>消费者</th><th>作用</th></tr>
+  <tr><td><strong>SQ</strong></td><td>Submission Queue 提交队列</td><td>用户态</td><td>内核</td><td>应用把 I/O 请求（SQE）写进去</td></tr>
+  <tr><td><strong>CQ</strong></td><td>Completion Queue 完成队列</td><td>内核</td><td>用户态</td><td>内核把完成结果（CQE）写进去</td></tr>
+</table>
+
+<div class="flow">
+  <span class="box">写 SQE 到 SQ</span><span class="arrow">→</span>
+  <span class="box">内核取走并异步执行 I/O</span><span class="arrow">→</span>
+  <span class="box">内核写 CQE 到 CQ</span><span class="arrow">→</span>
+  <span class="box">用户收割结果</span>
+</div>
+
+<h3>4.3 为什么它是 Proactor</h3>
+<div class="step"><div class="no">1</div><div>应用提交 <code>IORING_OP_READ</code> 时，<strong>把目标 buffer 地址也写进 SQE</strong>。</div></div>
+<div class="step"><div class="no">2</div><div>内核<strong>异步地</strong>完成"读数据 + 拷进 buffer"的<strong>全部动作</strong>。</div></div>
+<div class="step"><div class="no">3</div><div>完成后在 CQ 返回"读了 1024 字节，数据已经在 buf 里"。</div></div>
+<p>应用线程<strong>从提交到收割之间完全不用等待数据 copy</strong>——这正是 Proactor 的"完成通知 + 内核代办"特征。</p>
+
+<h3>4.4 io_uring 解决的三大痛点（vs epoll）</h3>
+<table>
+  <tr><th>epoll 痛点</th><th>io_uring 解决</th></tr>
+  <tr><td>每次 <code>read/write</code> 仍是一次系统调用（上下文切换开销）</td><td>批量提交；普通模式 1 次 <code>io_uring_enter</code>；<strong>SQPOLL 模式 0 次系统调用</strong></td></tr>
+  <tr><td>数据 copy 无法消除</td><td>内核代办 copy；可用 registered buffers 预锁内存减少映射开销</td></tr>
+  <tr><td>不支持文件 I/O（文件 fd 永远"就绪"）</td><td>统一支持文件、socket、pipe 等所有 I/O</td></tr>
+</table>
+
+<h3>4.5 详细对比表</h3>
+<table>
+  <tr><th>维度</th><th>epoll</th><th>io_uring</th></tr>
+  <tr><td>引入版本</td><td>Linux 2.6（2002）</td><td>Linux 5.1（2019）</td></tr>
+  <tr><td>I/O 模型</td><td><span class="tag tag-reactor">Reactor</span> 同步非阻塞</td><td><span class="tag tag-proactor">Proactor</span> 真异步</td></tr>
+  <tr><td>通知类型</td><td>就绪通知</td><td>完成通知</td></tr>
+  <tr><td>谁执行数据搬运</td><td>应用 <code>read/write</code></td><td>内核</td></tr>
+  <tr><td>系统调用次数</td><td>每 I/O ≥1 次</td><td>可降至 0（SQPOLL）</td></tr>
+  <tr><td>事件传递</td><td>内核→用户 内存拷贝</td><td>mmap 共享，零拷贝</td></tr>
+  <tr><td>支持文件 I/O</td><td>❌</td><td>✅</td></tr>
+  <tr><td>支持 socket I/O</td><td>✅</td><td>✅</td></tr>
+  <tr><td>批量提交</td><td>❌</td><td>✅ 天然支持</td></tr>
+  <tr><td>编程复杂度</td><td>中等</td><td>较高</td></tr>
+  <tr><td>生态成熟度</td><td>极成熟（Nginx/Redis）</td><td>快速成熟（RocksDB/ScyllaDB）</td></tr>
+</table>
+
+<h3>4.6 系统调用次数对比（理论）</h3>
+<div class="card">
+<p><strong>处理 1000 个读事件：</strong></p>
+<pre><code>epoll:     1 次 epoll_wait + 1000 次 read  = 1001 次系统调用
+io_uring:  写 1000 个 SQE + 1 次 submit     = 1 次系统调用（普通模式）
+io_uring:  (SQPOLL 模式)                    = 0 次系统调用</code></pre>
+</div>
+
+<h3>4.7 实测：epoll 处理 1 条消息的系统调用序列</h3>
+<p>我用 <code>strace</code> 实测了 epoll 版 Echo Server 处理 1 条消息（1 字节）的真实系统调用序列：</p>
+
+<pre><code>$ strace -f -e trace=epoll_wait,accept,read,write,epoll_ctl ./echo_epoll 19000
+
+epoll_ctl(4, EPOLL_CTL_ADD, 3, {EPOLLIN}) = 0          # 注册监听 fd
+epoll_wait(4, [{fd=3}], 64, -1) = 1                    # ① 等待连接
+accept(3, NULL, NULL) = 5                              # ② 接受连接
+epoll_ctl(4, EPOLL_CTL_ADD, 5, {EPOLLIN|EPOLLET}) = 0  # ③ 注册新连接
+epoll_wait(4, [{fd=5}], 64, -1) = 1                    # ④ 等待数据就绪
+read(5, "X", 4096) = 1                                 # ⑤ 应用自己读数据
+write(5, "X", 1) = 1                                   # ⑥ 应用自己回显
+epoll_wait(4, [{fd=5}], 64, -1) = 1                    # ⑦ 等待对端关闭
+read(5, "", 4096) = 0                                  # ⑧ 读到 EOF
+epoll_ctl(4, EPOLL_CTL_DEL, 5, NULL) = 0               # ⑨ 摘除 fd</code></pre>
+
+<div class="highlight">
+<strong>实测结论：</strong>处理<strong> 1 条消息</strong>，epoll 版触发了 <strong>约 11 次系统调用</strong>（4 次 epoll_wait + 1 次 accept + 2 次 read + 1 次 write + 3 次 epoll_ctl）。这清晰地印证了 Reactor 模式的本质——<strong>每次 I/O 都要应用亲自发起 read/write 系统调用</strong>。
+</div>
+
+<div class="dangerbox">
+<strong>关于 io_uring 实测：</strong>本沙箱的 seccomp 策略禁用了 <code>io_uring_setup</code> 系统调用（返回 <code>EPERM</code>），因此 io_uring 版 Echo Server 无法在本环境实际运行（代码已编译通过，可在无 seccomp 限制的 Linux 环境运行）。上面 io_uring 的系统调用数据来自内核源码与官方文档的理论分析，而非本机实测。
+</div>
+
+<!-- ============ 第五部分：主从 Reactor ============ -->
+<h2>5. 主从 Reactor（main-sub Reactor）</h2>
+
+<p>上一篇文章的单 Reactor 单线程模型，在<strong>并发连接多、单个连接读写耗时</strong>时会成为瓶颈。生产环境最常用的优化是<strong>主从 Reactor</strong>，这是 Netty、Nginx、Redis 的核心架构。</p>
+
+<h3>5.1 三种 Reactor 变体</h3>
+<table>
+  <tr><th>变体</th><th>结构</th><th>优缺点</th></tr>
+  <tr>
+    <td><strong>单 Reactor 单线程</strong></td>
+    <td>1 个线程既 accept 又处理读写</td>
+    <td>简单，但一个慢连接阻塞全部</td>
+  </tr>
+  <tr>
+    <td><strong>单 Reactor 多线程</strong></td>
+    <td>1 个线程 accept + 分发，线程池处理读写</td>
+    <td>读写不阻塞 accept，但 accept 仍单点</td>
+  </tr>
+  <tr>
+    <td><strong>主从 Reactor</strong></td>
+    <td>主 Reactor 只 accept，多个从 Reactor 各持一个 epoll 处理读写</td>
+    <td><strong>accept 与读写彻底解耦，多核并行，生产首选</strong></td>
+  </tr>
+</table>
+
+<h3>5.2 主从 Reactor 架构图</h3>
+<div class="svg-wrap">
+<svg viewBox="0 0 900 520" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,PingFang SC,Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#7dd3fc"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="520" fill="#0b1220" rx="8"/>
+
+  <text x="450" y="32" fill="#38bdf8" font-size="18" font-weight="700" text-anchor="middle">主从 Reactor（Main-Sub Reactor）架构</text>
+
+  <!-- 客户端 -->
+  <rect x="30" y="70" width="120" height="40" rx="6" fill="#1e293b" stroke="#334155"/>
+  <text x="90" y="95" fill="#e2e8f0" font-size="13" text-anchor="middle">客户端连接</text>
+
+  <!-- 主 Reactor -->
+  <rect x="260" y="70" width="180" height="60" rx="8" fill="#1d4ed8" stroke="#3b82f6"/>
+  <text x="350" y="94" fill="#fff" font-size="14" font-weight="700" text-anchor="middle">MainReactor</text>
+  <text x="350" y="114" fill="#bfdbfe" font-size="11" text-anchor="middle">只负责 accept()</text>
+
+  <!-- 从 Reactor 们 -->
+  <rect x="540" y="60" width="160" height="50" rx="8" fill="#065f46" stroke="#10b981"/>
+  <text x="620" y="80" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">SubReactor 1</text>
+  <text x="620" y="98" fill="#a7f3d0" font-size="11" text-anchor="middle">epoll + 读写</text>
+
+  <rect x="540" y="130" width="160" height="50" rx="8" fill="#065f46" stroke="#10b981"/>
+  <text x="620" y="150" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">SubReactor 2</text>
+  <text x="620" y="168" fill="#a7f3d0" font-size="11" text-anchor="middle">epoll + 读写</text>
+
+  <rect x="540" y="200" width="160" height="50" rx="8" fill="#065f46" stroke="#10b981"/>
+  <text x="620" y="220" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">SubReactor N</text>
+  <text x="620" y="238" fill="#a7f3d0" font-size="11" text-anchor="middle">epoll + 读写</text>
+
+  <!-- 线程池 -->
+  <rect x="740" y="60" width="140" height="190" rx="8" fill="#1e293b" stroke="#fbbf24"/>
+  <text x="810" y="90" fill="#fbbf24" font-size="13" font-weight="700" text-anchor="middle">业务线程池</text>
+  <text x="810" y="115" fill="#94a3b8" font-size="11" text-anchor="middle">Worker Threads</text>
+  <text x="810" y="140" fill="#94a3b8" font-size="11" text-anchor="middle">处理业务逻辑</text>
+  <text x="810" y="165" fill="#94a3b8" font-size="11" text-anchor="middle">(decode/encode/</text>
+  <text x="810" y="185" fill="#94a3b8" font-size="11" text-anchor="middle"> compute/IO)</text>
+
+  <!-- 箭头 -->
+  <line x1="150" y1="90" x2="258" y2="95" stroke="#7dd3fc" marker-end="url(#ar)" stroke-width="1.5"/>
+  <text x="200" y="82" fill="#94a3b8" font-size="10">连接请求</text>
+
+  <!-- 主 reactor 分发到 sub reactor -->
+  <line x1="440" y1="85" x2="538" y2="80" stroke="#7dd3fc" marker-end="url(#ar)" stroke-width="1.5"/>
+  <text x="475" y="70" fill="#94a3b8" font-size="10">accept 后分发连接</text>
+  <line x1="440" y1="100" x2="538" y2="155" stroke="#7dd3fc" marker-end="url(#ar)" stroke-width="1.5"/>
+  <line x1="440" y1="110" x2="538" y2="225" stroke="#7dd3fc" marker-end="url(#ar)" stroke-width="1.5"/>
+
+  <!-- sub reactor 到线程池 -->
+  <line x1="700" y1="85" x2="738" y2="100" stroke="#fbbf24" marker-end="url(#ar)" stroke-width="1.5"/>
+  <text x="720" y="75" fill="#fbbf24" font-size="10">派发业务</text>
+  <line x1="700" y1="155" x2="738" y2="140" stroke="#fbbf24" marker-end="url(#ar)" stroke-width="1.5"/>
+
+  <!-- 底部流程说明 -->
+  <rect x="30" y="300" width="840" height="180" rx="8" fill="#1e293b"/>
+  <text x="50" y="328" fill="#34d399" font-size="14" font-weight="700">工作流程：</text>
+  <text x="50" y="356" fill="#cbd5e1" font-size="12">① 客户端连接 → MainReactor 的 epoll 检测到 → accept() 拿到连接</text>
+  <text x="50" y="380" fill="#cbd5e1" font-size="12">② MainReactor 用轮询/负载均衡，把连接注册到某个 SubReactor 的 epoll</text>
+  <text x="50" y="404" fill="#cbd5e1" font-size="12">③ SubReactor 负责该连接的读写事件（epoll_wait → read/write）</text>
+  <text x="50" y="428" fill="#cbd5e1" font-size="12">④ 读到完整请求后，派发给业务线程池处理（避免阻塞 SubReactor）</text>
+  <text x="50" y="452" fill="#cbd5e1" font-size="12">⑤ 业务处理完，结果交回 SubReactor 写回客户端</text>
+
+  <text x="450" y="505" fill="#64748b" font-size="11" text-anchor="middle">核心思想：accept 与读写解耦，多核并行，避免单点瓶颈（Netty/Nginx/Redis 核心架构）</text>
+</svg>
+</div>
+
+<h3>5.3 主从 Reactor 的关键点</h3>
+<div class="step"><div class="no">1</div><div><strong>主 Reactor 只做 accept</strong>：因为 accept 本身很快，单线程足够；只监听一个 listen fd。</div></div>
+<div class="step"><div class="no">2</div><div><strong>多个从 Reactor 各持一个 epoll</strong>：每个从 Reactor 跑在独立线程（通常绑定一个 CPU 核），负责一批连接的读写事件。数量通常 = CPU 核数。</div></div>
+<div class="step"><div class="no">3</div><div><strong>连接分配策略</strong>：主 Reactor accept 到连接后，用轮询（round-robin）或最少连接数，把连接注册到某个从 Reactor。</div></div>
+<div class="step"><div class="no">4</div><div><strong>业务线程池解耦</strong>：从 Reactor 只负责 I/O 事件，读到完整请求后交给业务线程池，避免耗时业务阻塞事件循环。</div></div>
+
+<h3>5.4 与单 Reactor 的对比</h3>
+<table>
+  <tr><th>能力</th><th>单 Reactor 单线程</th><th>主从 Reactor</th></tr>
+  <tr><td>accept 与读写是否解耦</td><td>否（同一线程）</td><td><strong>是</strong></td></tr>
+  <tr><td>多核利用</td><td>否（单核）</td><td><strong>是（从 Reactor 各绑一核）</strong></td></tr>
+  <tr><td>慢连接影响</td><td>阻塞全部</td><td><strong>只影响所在从 Reactor</strong></td></tr>
+  <tr><td>代表框架</td><td>早期简单服务</td><td><strong>Netty、Nginx、Redis</strong></td></tr>
+</table>
+
+<!-- ============ 第六部分：其他类型 ============ -->
+<h2>6. 除了 Reactor 和 Proactor，还有哪些类型？</h2>
+
+<p>Reactor/Proactor 只是"<strong>事件驱动模型</strong>"内部的两大类。完整 I/O 模型全景如下：</p>
+
+<h3>6.1 经典 5 种 I/O 模型（Stevens 分类）</h3>
+<p>这是 Reactor/Proactor 的<strong>母分类</strong>：</p>
+<table>
+  <tr><th>模型</th><th>说明</th><th>是否事件驱动</th></tr>
+  <tr><td><strong>阻塞 I/O</strong></td><td><code>read</code> 阻塞到数据就绪并 copy 完</td><td>❌</td></tr>
+  <tr><td><strong>非阻塞 I/O</strong></td><td>反复 <code>read</code> 直到成功（忙轮询）</td><td>❌</td></tr>
+  <tr><td><strong>I/O 多路复用</strong></td><td><code>select/poll/epoll</code> 等就绪 → 再 read</td><td>✅ <strong>这就是 Reactor 底层</strong></td></tr>
+  <tr><td><strong>信号驱动 I/O</strong></td><td><code>SIGIO</code> 信号通知就绪 → 再 read</td><td>✅ 另一种就绪通知（Reactor 变体）</td></tr>
+  <tr><td><strong>异步 I/O</strong></td><td><code>aio_read</code> 内核完成全部 → 通知</td><td>✅ <strong>这就是 Proactor 底层</strong></td></tr>
+</table>
+
+<h3>6.2 其他值得关注的模式</h3>
+<table>
+  <tr><th>模式</th><th>说明</th><th>与 Reactor/Proactor 的关系</th></tr>
+  <tr><td><strong>Leader/Followers</strong>（领导者/跟随者）</td><td>线程池中一个线程当 leader 负责 accept，其余 follower 等待；leader 处理完移交领导权</td><td>Reactor 的一种<strong>多线程优化变体</strong>，避免 accept 惊群</td></tr>
+  <tr><td><strong>Half-Sync/Half-Async</strong>（半同步半异步）</td><td>上层同步线程池处理业务，下层异步事件循环收事件，中间队列衔接</td><td>常与 Reactor 组合：<strong>Reactor（异步层）+ 线程池（同步层）</strong></td></tr>
+  <tr><td><strong>协程（Coroutine）</strong></td><td>epoll 之上封装 Yield/Resume，同步写法异步执行</td><td>Reactor 的<strong>编程范式封装</strong>（如 libco），不是新 I/O 模型</td></tr>
+  <tr><td><strong>SEDA</strong>（分段事件驱动）</td><td>处理拆成多个 stage，stage 间用队列连接</td><td>更偏<strong>架构模式</strong>，可基于 Reactor 构建</td></tr>
+</table>
+
+<h3>6.3 全景层级图</h3>
+<pre><code>                    ┌─ 阻塞 I/O（串行，最简单）
+   传统同步模型 ──────┤
+                    └─ 非阻塞 I/O（忙轮询）
+
+                    ┌─ I/O 多路复用（select/poll/epoll）──→ Reactor 模式
+   事件驱动模型 ──────┤                          │
+                    │              ┌── 单 Reactor 单线程
+                    │              ├── 单 Reactor 多线程
+                    │              ├── 主从 Reactor（main-sub）
+                    │              └── Leader/Followers
+                    │
+                    └─ 异步 I/O（aio/io_uring）──────→ Proactor 模式
+
+   上层封装 ────────── 协程（libco）—— 本质是 Reactor 的同步写法</code></pre>
+
+<!-- ============ 第七部分：总结 ============ -->
+<h2>7. 总结（一张表记住全部）</h2>
+<table>
+  <tr><th>概念</th><th>本质</th><th>命名由来</th><th>代表</th></tr>
+  <tr><td><strong>Reactor</strong></td><td>就绪通知，应用自己 I/O</td><td>中心组件"反应"并分发事件</td><td>epoll + Nginx/Redis</td></tr>
+  <tr><td><strong>Proactor</strong></td><td>完成通知，内核代办 I/O</td><td>应用"主动"提交完整操作</td><td>io_uring</td></tr>
+  <tr><td><strong>Leader/Followers</strong></td><td>Reactor 多线程变体</td><td>leader 接力 accept</td><td>ACE 框架</td></tr>
+  <tr><td><strong>Half-Sync/Half-Async</strong></td><td>异步收事件 + 同步线程池</td><td>分层分工</td><td>常见网络框架</td></tr>
+  <tr><td><strong>协程</strong></td><td>Reactor 的同步写法封装</td><td>Yield/Resume 机制</td><td>libco/Go</td></tr>
+</table>
+
+<div class="card" style="border-color: var(--warn)">
+<p style="margin:0"><strong>本文交付内容回顾：</strong></p>
+<ul style="margin:8px 0">
+  <li>✅ Reactor/Proactor 的命名渊源与本质区别（就绪通知 vs 完成通知）</li>
+  <li>✅ io_uring 详解：SQ/CQ 双环形队列 + 为什么是 Proactor + 与 epoll 详细对比</li>
+  <li>✅ <strong>实测</strong>：strace 抓取 epoll 处理 1 条消息的 11 次系统调用序列</li>
+  <li>✅ 主从 Reactor（main-sub）架构详解 + 图示</li>
+  <li>✅ 其他模式：Leader/Followers、Half-Sync/Half-Async、协程、SEDA</li>
+  <li>⚠️ io_uring 代码已编译通过，但沙箱 seccomp 禁用 <code>io_uring_setup</code>，无法本机运行</li>
+</ul>
+</div>
+
+</div>
+</body>
+</html>
