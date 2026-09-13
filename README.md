@@ -123,6 +123,8 @@ io-study/
 | `make bench_net_matrix` | 网络 I/O 多维度对比（服务端 × 连接数 × 消息大小 × TCP_NODELAY），产出 `results/*.md` + `.csv` |
 | `make clean` | 清理 `bin/` 与测试文件 |
 | `make help` | 查看全部目标与参数 |
+| `make macos` | **仅 macOS**：编译 kqueue 版 echo / F_NOCACHE 磁盘基准 / 压测客户端 |
+| `make compdb` | 生成 `compile_commands.json`（给 clangd / IDE 用，需 `bear`） |
 
 ### 可调参数
 
@@ -197,6 +199,22 @@ sudo yum install -y gcc gcc-c++ make libaio-devel liburing-devel strace
 - **liburing**：io_uring 实验需要（只装运行时也能跑，开发包用于编译）
 - **strace**：系统调用对比实验需要
 - **Python 3**：`network/bench.py` 压测需要
+
+**可选（为了编辑体验）**：
+
+```bash
+sudo apt-get install -y bear clangd        # bear 用来生成编译数据库
+make compdb                                # 产出 compile_commands.json
+```
+
+clangd 会自动读取项目根目录的 `compile_commands.json`，于是跳转、补全、报错都能用上
+Makefile 里的**真实编译参数**（包括 `-DHAVE_SQE_DATA64=1` 这类由版本探测决定的条件宏）。
+VS Code / Cursor 装 **clangd 扩展**即可；用 Remote-SSH 连 Linux 机器时，
+把扩展的 `clangd.path` 指向远端 `/usr/bin/clangd`。
+
+> ⚠️ `compile_commands.json` 里是**绝对路径**，在共享挂载目录下只对生成它的那台机器有效
+> （比如 VM 里生成的是 `/home/ubuntu/...`，在 Mac 上打开就解析不了），
+> 所以它**没有提交进仓库**（见 `.gitignore`），换机器重新 `make compdb` 即可。
 
 > io_uring 还需要 **Linux 5.1+**（建议 5.10+），且不被 seccomp 禁用。
 > 容器环境默认 seccomp 会拦截 `io_uring_setup`，需要 `--security-opt seccomp=unconfined`。
