@@ -395,7 +395,7 @@ python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 | 文档 | 内容概要 |
 | --- | --- |
 | [深入浅出 epoll 编程](./docs/md/04-epoll-编程指南.md) | 四个 API 逐个讲、LT/ET 的内核实现差异、回调路径、11 条陷阱、每条消息 3.0 次系统调用的由来 |
-| [深入浅出 io_uring 编程](./docs/md/05-io_uring-编程指南.md) | SQ/CQ 三个内存结构、提交与收割的三种风格、SQPOLL/提供缓冲区/固定文件表/零拷贝、如何把系统调用降到 0 |
+| [深入浅出 io_uring 编程](./docs/md/05-io_uring-编程指南.md) | SQ/CQ 三个内存结构、**内核里发生了什么**（提交后的三条路：就地完成 / poll 挂起 / punt 到 io-wq，附 `fdinfo` 环状态解读与 SQ 线程开销实测）、提交与收割的三种风格、SQPOLL/提供缓冲区/固定文件表/零拷贝、如何把系统调用降到 0 |
 | [深入浅出 libaio 编程](./docs/md/06-libaio-编程指南.md) | iocb/io_submit/io_getevents 三件套、为什么只有 `O_DIRECT` 是真异步、深度换吞吐 25 倍、与 io_uring 的取舍 |
 
 **两份总结**：

@@ -24,7 +24,7 @@ io_uring 是**完成通知 + 内核代做 I/O**：你只描述「把 fd 的数�
 |---|---|---|
 | 通知内容 | "这个 fd **可读**了" | "这个请求**已经完成**了" |
 | 谁搬数据 | 应用调 `read()` | **内核** |
-| 每条消息的系统调用 | read + write + 等待 ≈ 3 次 | 提交 + 收割，可低到 **0 次**（见 §7.2） |
+| 每条消息的系统调用 | read + write + 等待 ≈ 3 次 | 提交 + 收割，可低到 **0 次**（见 §7.7 的实测总账） |
 | 接口形态 | fd 事件循环 | **提交队列 / 完成队列**（两个环形缓冲区） |
 
 ## 2. 三个内存结构（理解一切的基础）
@@ -150,7 +150,7 @@ struct io_uring_sqe {
 | `IOSQE_IO_LINK` | `1<<2` | 与下一个 SQE 串成链：前一个失败则整链取消 |
 | `IOSQE_IO_HARDLINK` | `1<<3` | 同上，但前一个失败也继续执行 |
 | `IOSQE_ASYNC` | `1<<4` | 强制走异步路径（丢给 io-wq 线程池） |
-| `IOSQE_BUFFER_SELECT` | `1<<5` | 让内核从提供缓冲区环里自选一块（见 §6.2） |
+| `IOSQE_BUFFER_SELECT` | `1<<5` | 让内核从提供缓冲区环里自选一块（见 §7.2） |
 | `IOSQE_CQE_SKIP_SUCCESS` | `1<<6` | 成功时不产生 CQE（省收割开销） |
 
 **⚠️ 顺序陷阱**：liburing 的 `io_uring_prep_*()` 内部会**先清零 `flags`/`ioprio`**，
@@ -271,7 +271,7 @@ int io_uring_register_buffers(struct io_uring *ring, const struct iovec *iov, un
   `register_files_sparse` 先登记 N 个空槽，造连接时再用 `multishot_accept_direct` 自动分配。
 - **注销单个槽位**：`io_uring_register_files_update(ring, idx, &neg_one, 1)`，`-1` 就是"清空这个槽"。
   **固定文件表里的文件不能直接 `close()`**。
-- **注册缓冲区环**：见 §6.2。
+- **注册缓冲区环**：见 §7.2。
 
 ### 4.7 完成事件的 flags
 
@@ -287,7 +287,209 @@ int io_uring_register_buffers(struct io_uring *ring, const struct iovec *iov, un
 说明"这次 recv 还在继续"，**不要**再补提交；只有**没有** `F_MORE` 时才需要重新挂 recv。
 把这个判断写反，会挂出多条在飞的 recv，症状是数据被重复处理或乱序。
 
-## 5. 完整示例：最朴素但正确的 echo server
+## 5. 内核里发生了什么
+
+前面四节讲的是"怎么调用"。这一节讲**提交之后到完成之前，内核到底做了什么** ——
+04 篇和 06 篇都有对应的内容，io_uring 尤其需要它：因为它的"异步"是一个**接口层面的承诺**，
+而内核究竟怎么兑现这个承诺，直接决定了你能拿到多少性能（也直接解释了第 8 章那些陷阱为什么是陷阱）。
+
+### 5.1 建环时内核建了什么
+
+`io_uring_setup(entries, params)` 做的第一件事是创建一个 `struct io_ring_ctx`，并返回一个**匿名 fd**
+—— 这个 fd 不对应任何文件或 socket，它只是一个句柄：用来 `mmap` 那几块共享内存，
+以及当 `io_uring_enter` 的第一个参数。
+
+拿到的内存布局（用 `IORING_FEAT_SINGLE_MMAP` 时 SQ 环与 CQ 环会合并成一次 mmap）：
+
+```
+            用户态                              内核态
+   ┌──────────────────────────┐
+   │ SQ 环：head / tail /      │   应用写 tail；内核写 head
+   │        ring_mask /        │
+   │        array[] ← 间接层   │
+   ├──────────────────────────┤
+   │ SQE 数组（64B × 条目数）  │   应用填；内核读
+   ├──────────────────────────┤
+   │ CQ 环：head / tail /      │   内核写 tail；应用写 head
+   │        ring_mask /overflow│
+   ├──────────────────────────┤
+   │ CQE 数组（16B × 条目数）  │   内核填；应用读
+   └──────────────────────────┘
+```
+
+两个最容易忽略、但很关键的点：
+
+**① SQ 环里有一个 `array` 间接层。** 填一个 SQE 的完整顺序是：
+
+```c
+unsigned idx = sq->sqe_tail & *sq->kring_mask;
+sq->sqes[idx] = ...;                                      /* 1. 把 64 字节的 SQE 写进 SQE 数组 */
+sq->array[idx] = idx;                                     /* 2. 把"下标"写进 SQ 环的 array[]  */
+io_uring_smp_store_release(sq->ktail, ++sq->sqe_tail);    /* 3. 发布 tail（注意是 release 语义） */
+```
+
+内核是**从 `array[]` 读下标、再去 SQE 数组取条目**的。这层间接的意义是：
+**SQ 环的长度可以小于 SQE 数组的长度**（环里只放"本轮可提交的"。liburing 内部就是这么做的）。
+内核后来提供了 `IORING_SETUP_NO_SQARRAY`（注释原文："Removes indirection through the SQ index array"）
+来省掉它，让 SQ 环直接指向 SQE 数组。
+
+**② 第 3 步必须是带"释放语义"的写（release store）**，内核侧用 acquire 读 tail。
+少了这个屏障，内核可能在 SQE 内容写完之前就看到新 tail，从而读到一个**半填的请求** ——
+这类 bug 的典型症状是"平时都对、压测偶发错"。用 liburing 的 `io_uring_get_sqe()`/`submit()` 时这些都由它处理；
+**只有手写环才需要自己在意**。
+
+### 5.2 提交之后：`io_submit_sqes` 的三条路
+
+`io_uring_enter(fd, to_submit, min_complete, flags)` 进来后，内核把这 `to_submit` 个 SQE
+逐个走 `io_init_req()` → `io_issue_sqe()`。**每个请求会落到三条路中的一条** ——
+这是理解 io_uring 性能的**全部关键**：
+
+| 路径 | 什么时候走 | 代价 |
+|---|---|---|
+| **① 就地完成（inline）** | 不需要等就能做完：socket 缓冲区里**已经有数据**、page cache 命中 | 就在**提交者的上下文**里做完，最便宜 |
+| **② poll 挂起** | 需要等，但可以等事件（需 `IORING_FEAT_FAST_POLL`） | 把请求挂到 fd 的等待队列（`io_arm_poll_handler`），**不占线程**；数据到达由回调重新投递 |
+| **③ punt 到 io-wq** | 内核判断"这个操作在这里做**可能会阻塞**" | 甩给 **io-wq 工作线程池**，多一次跨线程交接（外加调度与唤醒） |
+
+**路径 ② 是 io_uring 的精华**：等数据的时间由一个"挂起的事件"表示，而不是一个睡着的线程。
+所以一万条连接只需要**一个** ring，而不是一万个线程 —— 这是它相对"每连接一个线程"的根本差别。
+
+判断某个请求走了哪条路，看两个地方就够：
+
+```bash
+# 出现 iou-wrk-* 线程 → 有请求被 punt 到工作线程池（路径 ③）
+ps -o comm= -L -p <PID> | sort | uniq -c
+
+# fdinfo 里 PollList 非空 → 有请求正挂在 poll 上（路径 ②）
+grep -A3 PollList /proc/<PID>/fdinfo/<ringfd>
+```
+
+**本项目实测的对照**（同一份代码、同一台机器，只换被测对象）：
+
+| 场景 | 观察到的内核线程 | 走的是哪条路 |
+|---|---|---|
+| 网络 echo（recv / send） | 只有 `iou-sqp-*` | ①/②，**没有 punt** |
+| 磁盘 `O_DIRECT` **读** | 无 `iou-wrk-*` | 快路径 |
+| 磁盘 `O_DIRECT` **写**（内核 5.15） | **15 个 `iou-wrk-*`** | ③ —— 写 IOPS 因此只有 libaio 的 **0.23x**（同一测试在 7.0 上只剩 1 个 `iou-wrk-*`，比值回到 0.89x） |
+| 强制异步 `IOSQE_ASYNC` | — | 不问内核判断，**显式要求走 ③** |
+
+> **一句话总结这一节**：io_uring 是**接口层面的异步**，但内核经常会**就地同步执行**它。
+> 所以"用了 io_uring 就应该更快"是个错误前提 —— 快不快取决于你的请求落在哪条路上。
+
+### 5.3 完成是怎么回到用户态的
+
+请求做完后，内核把 16 字节的 CQE 写进 `cqes[cq_tail & mask]`，然后发布 `CqTail`。
+应用在共享内存里看到 tail 前进，就知道有新完成可收。三个由此而来的规则：
+
+- **必须"消费"**：应用要把 `CqHead` 往前推（`cqe_seen` / `cq_advance`），否则 CQ 环不腾空间。
+  环满后内核进入 overflow 状态 —— `IORING_FEAT_NODROP` 只能保证事件不丢，救不了不消费的应用。
+- **multishot 用 `F_MORE` 表达"我还活着"**：一次提交的 recv 会持续产生 CQE，每个都带
+  `IORING_CQE_F_MORE`；只有**没有** `F_MORE` 的那个才需要补提交。
+- **内核会尽量少碰那块共享内存**：这就是 fdinfo 里除了 `SqHead` 还有 `CachedSqHead` 的原因 ——
+  内核内部维护了一份**缓存副本**，只在必要时才去读写共享内存。
+  共享内存里的 head/tail 是**被两个方向反复读写的变量**，每次访问都可能让 cache line 在核间弹（bounce），
+  "缓存 + 批量更新"就是为了减少这种弹跳。
+
+### 5.4 内核把环的状态全暴露在 `/proc/<pid>/fdinfo/<ringfd>`
+
+上面讲的每一条机制，都可以**直接读出来** —— 这是调 io_uring 最有用、却最少人知道的手段：
+
+```bash
+$ PID=$(pgrep -f echo_io_uring_modern)
+$ grep -l io_uring /proc/$PID/fdinfo/*        # 找到 ring fd 的编号
+$ cat /proc/$PID/fdinfo/<ringfd>
+SqMask:         0x3ff        # SQ 环 1024 个槽位
+SqHead:         1            # 内核已消费到哪（内核写、应用读）
+SqTail:         1            # 应用已提交到哪（应用写、内核读）→ head==tail 即已全部消费
+CachedSqHead:   1            # 内核的内部缓存副本（少碰共享内存用）★ 见 5.3
+CqMask:         0x7ff        # CQ 环 2048 个槽位 ← 是 SQ 的 2 倍
+CqHead:         0            # 应用已消费到哪
+CqTail:         0            # 内核已发布到哪 → head==tail 即没有待收割的完成
+CachedCqTail:   0
+SQEs:           0            # 还没提交的 SQE 数
+CQEs:           0            # 还没消费的 CQE 数
+SqThread:       428951       # SQPOLL 内核线程 TID（没开 SQPOLL 就没有这行）
+SqThreadCpu:    5            # 它被绑到核 5（即 SQ_AFF）
+SqTotalTime:    1000909      # SQ 线程累计运行时间（微秒）★ 见 5.5
+SqWorkTime:     0            # 其中真正在提交请求的时间
+UserFiles:      1024         # 固定文件表登记了 1024 个槽位（register_files_sparse）
+UserBufs:       0            # 注册缓冲区（io_uring_register_buffers）；我们用缓冲区环，不走这个
+PollList:
+  op=13, task_works=0        # 有请求挂在 poll 上；13 = IORING_OP_ACCEPT ← multishot accept 正等着
+CqOverflowList:              # 空 = CQ 从未溢出
+NAPI:           disabled     # 还有更激进的一档：IORING_REGISTER_NAPI
+```
+
+几乎每一行都在呼应前面的某一节：
+
+- `SqMask 0x3ff` / `CqMask 0x7ff` 印证 §2 说的"申请 N 个、CQ 给 2N"（这里是申请 1024 → 给 2048）。
+- `CachedSqHead` / `CachedCqTail` 就是 §5.3 说的那两份内部副本。
+- `PollList: op=13` 就是 §5.2 的**路径 ②**，而 13 正是 `IORING_OP_ACCEPT`
+  （opcode 从 `NOP=0` 开始顺序数）—— `multishot accept` 正挂在监听 socket 的 poll 上等新连接。
+- `SqThread` / `SqThreadCpu` 是 §7.1 的 SQPOLL + `SQ_AFF`（绑到了核 5）。
+- `UserFiles: 1024` 是 §7.4 的 `register_files_sparse` 登记的固定文件表。
+
+### 5.5 SQPOLL 的内核线程到底在干什么（实测）
+
+`SqTotalTime` / `SqWorkTime` 这两个字段，能把"SQPOLL 会烧掉一个核"从形容词变成数字。
+实测（内核 7.0，`ECHO_SQ_CPU=5`；单位是**微秒** —— 用"增量 ÷ 墙钟"对齐验证过）：
+
+| 状态 | `SqTotalTime` 增量 | `SqWorkTime` | 解读 |
+|---|---|---|---|
+| **空闲**（无流量，观测 6 秒） | **0**（冻在 ≈1.0009 s） | 0 | 空闲约 1 秒后线程就 **park** 了 —— 纯空转**不**烧核 |
+| **有流量**（16 线程 × 256B，6 秒） | **5,992,736 µs ≈ 5.99 s** | 2,635,236 µs ≈ 2.64 s | 线程 **99% 的时间都在跑**，但只有 **37.7%** 在真正提交 |
+
+两个结论：
+
+1. **忙碌时它 99% 的时间在自旋**，真正干活（提交 SQE）只占 37.7%。
+   所以"必须给 SQ 线程一个独立的核"不是玄学 —— 它确实在占满一个核。
+   这也解释了 §7.1 那个实测：把服务端 `taskset` 到单核后，QPS 从 63k 掉到 **15.4k**（比不开 SQPOLL 还慢）。
+2. **空闲时它会自己停下**（约 1 秒没活就 park），不会一直空烧。
+   park 时长由建环参数 `params.sq_thread_idle`（毫秒）决定 —— 调大省 CPU、调小更灵敏。
+
+> 观测方法：`grep -E 'SqTotalTime|SqWorkTime' /proc/<PID>/fdinfo/<ringfd>`，间隔取两次做差。
+> 这是回答"这个优化到底花了多少 CPU"最直接的证据。
+
+### 5.6 一条消息的完整内核路径
+
+把上面几节串起来，一次 echo 往返在内核里的流动是这样的：
+
+```
+① 客户端数据到达 → 协议栈 → sock_def_readable() → 唤醒该 socket 的等待队列
+      └─ 触发之前 poll 挂起的那个 recv（路径 ② 的回调）
+           └─ 重新投递这条 recv → 此时数据已在缓冲区，**就地在回调里完成**（路径 ①）
+                └─ 填 CQE、发布 CqTail
+
+② 应用收割到完成 → 准备 send SQE → 发布 SqTail      ← 到这一步都还没进内核
+      ├─ 非 SQPOLL：应用调 io_uring_enter 提交
+      └─ SQPOLL   ：iou-sqp-* 内核线程自己看到并提交
+           └─ send 就地完成（路径 ①）→ 再填一个 CQE
+
+③ 应用再次收割 → 判断是否要续挂 recv（看 F_MORE / 部分写）
+```
+
+本项目实测过其中一环的代价：**回环**下 `send` 会在发送方的上下文里
+**内联执行接收方向的软中断**（`tcp_sendmsg → __dev_queue_xmit → __local_bh_enable_ip → do_softirq`），
+于是 perf 采样里近 **70% 的 CPU 花在"等与唤醒"**（`__wake_up_sync_key` 41.7% + 自旋锁 27.4%），
+而不是搬数据。这解释了为什么把系统调用从 2.01 次/条降到 0.95 次/条，吞吐却几乎不动 ——
+**省掉的不是瓶颈，瓶颈在唤醒路径上。**
+
+### 5.7 这些机制解释了什么
+
+前面几章那些"必须这么写"的规则，基本都是下面这些机制的推论：
+
+| 现象 / 规则 | 内核里的原因 |
+|---|---|
+| "每轮循环都调 `io_uring_submit` 也不会白花系统调用" | liburing 发现 SQ 里没有待提交就直接返回；提交本身只是写共享内存 |
+| "省系统调用" ≠ 更快 | `io_uring_enter` 的主要代价在带 `GETEVENTS` 时"睡下去再被唤醒"，不在调用本身 |
+| recv 有时"立刻就完成" | 数据已在 socket 缓冲区 → 走**路径 ①**，根本没进等待 |
+| `O_DIRECT` 写明显落后于 libaio | 写被 punt 到 io-wq（**路径 ③**），读走快路径 |
+| SQPOLL 必须独占一个核 | `iou-sqp-*` 忙碌时 99% 的时间在自旋（§5.5 实测） |
+| 不消费 CQE 就"再也不收完成" | CQ 环 head 不前进 → 环填满 → overflow |
+| multishot 必须判断 `F_MORE` | 内核用 `F_MORE` 表达"这个请求还在继续"；误判会挂出多条在飞请求 |
+| 常驻 recv vs「发完再挂 recv」差 1.55x | 常驻 recv 常走**路径 ②**（挂起+唤醒）；发完再挂时对端回复往往已在缓冲区 → 走**路径 ①**（注：这是回环放大的效应，真实网络下常驻 recv 才是对的） |
+| 共享内存的 head/tail 为什么要"缓存副本" | 它是跨核反复读写的变量，每次访问都可能让 cache line 在核间弹 |
+
+## 6. 完整示例：最朴素但正确的 echo server
 
 完整可运行版本是 **[`examples/io_uring_echo.c`](../../examples/io_uring_echo.c)**（`make examples`）。
 它**刻意不用 SQPOLL**，好让你先把"提交/收割"这两件事看清楚。骨架如下：
@@ -369,11 +571,11 @@ io_uring_enter(4, 0, 1, IORING_ENTER_GETEVENTS, NULL, 8) = 0     ← 没活了�
 - io_uring：只有 `io_uring_enter` 一种调用，且一次可以提交/收割多个。
   **注意 `accept(2)` / `recvfrom(2)` / `sendto(2)` 一次都没出现** —— 内核替我们做了。
 
-## 6. 高级特性（现代写法）
+## 7. 高级特性（现代写法）
 
 每个特性都会给出"它解决什么问题 / 怎么用 / 什么代价"。
 
-### 6.1 SQPOLL：提交不进内核
+### 7.1 SQPOLL：提交不进内核
 
 ```c
 p.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
@@ -391,7 +593,7 @@ p.sq_thread_cpu = 5;                 /* 给 SQ 内核线程单独一个核 */
   `IORING_SETUP_COOP_TASKRUN` / `IORING_SETUP_DEFER_TASKRUN` 同时用；
   但可以与 `IORING_SETUP_SINGLE_ISSUER` 共存。
 
-### 6.2 提供缓冲区环：内存从 O(连接数) 降到 O(缓冲数)
+### 7.2 提供缓冲区环：内存从 O(连接数) 降到 O(缓冲数)
 
 普通做法要"每条连接常驻一块接收缓冲区"。提供缓冲区环反过来：应用先把一批缓冲区
 挂到环上，提交 recv 时**让内核自己挑一块**，完成后在 CQE flags 里告诉你是哪一块。
@@ -430,7 +632,7 @@ io_uring_buf_ring_advance(br, 1);
 - **⚠️ 归还时机**：缓冲区被 send 引用期间**不能归还**。零拷贝发送要等 `F_NOTIF` 那个 CQE。
 - 缓冲区用尽时内核返回 `-ENOBUFS`，且 multishot 会结束，需要补提交。
 
-### 6.3 multishot：一次提交，持续收割
+### 7.3 multishot：一次提交，持续收割
 
 ```c
 io_uring_prep_recv_multishot(sqe, fd, NULL, 0, 0);            /* ★ 注意不是独立 opcode */
@@ -445,7 +647,7 @@ accept 同理：`IORING_ACCEPT_MULTISHOT` = `1<<0`。
 
 收益：把"每条消息提交一次"变成"每条连接提交一次"，是**质变**。
 
-### 6.4 固定文件表 + direct accept：连接建立也不用系统调用
+### 7.4 固定文件表 + direct accept：连接建立也不用系统调用
 
 ```c
 io_uring_register_files_sparse(&ring, MAX_CONNS);         /* 先登记 N 个空槽 */
@@ -470,7 +672,7 @@ io_uring_register_files_update(&ring, idx, &neg, 1);
   理论收益要到大连接数 / 大 fd 表才显现。所以"用了固定表就一定更快"是错的，
   但你至少要会写。
 
-### 6.5 SEND_ZC 零拷贝发送 —— 默认别开
+### 7.5 SEND_ZC 零拷贝发送 —— 默认别开
 
 ```c
 io_uring_prep_send_zc(sqe, fd, buf, len, MSG_NOSIGNAL, 0);
@@ -488,7 +690,7 @@ io_uring_prep_send_zc(sqe, fd, buf, len, MSG_NOSIGNAL, 0);
   （还要注意 `IORING_NOTIF_USAGE_ZC_COPIED` 标志 —— 它表示"内核其实被迫拷了一份"，
   说明没真零拷贝成功）。
 
-### 6.6 CQ 忙轮询：收割也不进内核
+### 7.6 CQ 忙轮询：收割也不进内核
 
 ```c
 unsigned n = io_uring_peek_batch_cqe(&ring, cqes, 64);   /* 只看用户态共享内存 */
@@ -503,7 +705,7 @@ io_uring_cq_advance(&ring, n);
   原因很好记：**"省一半系统调用"没用，"把等待那一次省掉"才有用** ——
   因为进内核等待意味着进程要睡下去再被唤醒。
 
-### 6.7 现代版的实测总账（内核 7.0，16 线程 × 256B）
+### 7.7 现代版的实测总账（内核 7.0，16 线程 × 256B）
 
 | 配置 | 核数 | QPS | 每条消息的 io_uring_enter |
 |---|---|---|---|
@@ -516,7 +718,7 @@ io_uring_cq_advance(&ring, n);
 
 **233k / 112k = 2.08x**，且稳态系统调用为 0。这是本项目里 io_uring 唯一明确赢过 epoll 的路径。
 
-## 7. 陷阱清单
+## 8. 陷阱清单
 
 | 陷阱 | 症状 | 正确做法 |
 |---|---|---|
@@ -539,7 +741,7 @@ io_uring_cq_advance(&ring, n);
 > 判定宏要用 `IORING_OFF_PBUF_RING`（它和那些结构体同批引入），
 > **不能**用 `IOU_PBUF_RING_MMAP`（那是 enum，`#ifdef` 看不见）。
 
-## 8. 调试手段
+## 9. 调试手段
 
 ```bash
 # 1) 看提交/收割的系统调用序列（最能说明问题）
@@ -556,16 +758,28 @@ ls /proc/<PID>/task | wc -l
 # 4) 找热点（虚拟机无 PMU 时用软件事件）
 sudo perf record -e cpu-clock -F 3000 --call-graph fp -p <PID> -- sleep 6
 sudo perf report --stdio -percent-limit 1
+
+# 5) ★ 直接读内核暴露出来的环状态（最被低估的一招，详见 §5.4）
+FD=$(grep -l io_uring /proc/<PID>/fdinfo/* | head -1 | xargs basename)
+cat /proc/<PID>/fdinfo/$FD      # SqHead/SqTail/CqHead/CqTail/PollList/SqTotalTime...
+
+# 6) 看 SQPOLL 内核线程到底花了多少 CPU（§5.5）：取两次做差
+grep -E 'SqTotalTime|SqWorkTime' /proc/<PID>/fdinfo/$FD
 ```
+
+**`fdinfo` 是排"卡住了/不干活了"这类问题的首选**：一眼就能看出是 SQ 没提交（`SqHead != SqTail`）、
+还是完成没收（`CqTail != CqHead`）、还是有请求挂在 poll 上没回来（`PollList` 非空）、
+还是 CQ 已经溢出过（`CqOverflowList` 非空）。这些信息 strace 和 perf 都给不了。
 
 **`iou-wrk-*` 线程是个重要信号**：它意味着内核认为这个操作"不能在这里直接做"，
 甩给了异步工作线程池，每次 I/O 多一次跨线程交接。
-本项目的磁盘版就是靠这个发现 **O_DIRECT 写被 punt 到 io-wq**，所以写只有 libaio 的一半，
-而读（不需要 punt）能和 libaio 持平。
+本项目的磁盘版就是靠这个发现 **O_DIRECT 写被 punt 到 io-wq**，写 IOPS 只有 libaio 的 0.23x（内核 5.15），
+而读（不需要 punt）能和 libaio 持平甚至反超。
 
-## 9. 学这一套的顺序建议
+## 10. 学这一套的顺序建议
 
-1. 先用 §5 的朴素版本跑通 echo，用 strace 看清 `io_uring_enter` 的两种形态
+0. 先读 §5，记住"提交之后内核会走三条路"—— 后面所有"为什么这样写"的规则都是它的推论。
+1. 先用 §6 的朴素版本跑通 echo，用 strace 看清 `io_uring_enter` 的两种形态
    （提交 / `IORING_ENTER_GETEVENTS` 等待）。
 2. 加忙轮询，用 `perf stat` 验证 enter 次数下降。
 3. 加 SQPOLL，**注意给它独立核**，观察 2x 提升。
