@@ -23,3 +23,8 @@ __pycache__/
 .mnt2/
 .cache_test/
 .sync_test/
+
+# IDE 用：clangd 的编译数据库。
+# 内容是**本机绝对路径**（如 /home/ubuntu/workspace/io-study/...），
+# 换机器就失效，所以不提交；用 `make compdb` 重新生成。
+compile_commands.json

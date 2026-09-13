@@ -124,7 +124,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 .PHONY: all disk net demos examples libco bench bench_demo bench_net bench_net_matrix \
-        bench_disk_matrix macos check clean help FORCE
+        bench_disk_matrix macos compdb check clean help FORCE
 
 all: disk net demos
 
@@ -141,6 +141,7 @@ help:
 	@if [ "$(UNAME_S)" = "Darwin" ]; then \
 	  echo "    make macos      编译 macOS 对等实现 (echo_kqueue / io_macos / bench_client)"; \
 	fi
+	@echo "    make compdb     生成 compile_commands.json（给 clangd / IDE 用，需 bear）"
 	@echo "    make libco      编译 libco 与协程 bench（需先 clone 到 third_party/libco）"
 	@echo ""
 	@echo "  运行："
@@ -389,6 +390,26 @@ $(BINDIR)/ex_io_uring_echo: $(EXDIR)/io_uring_echo.c | $(BINDIR)
 $(BINDIR)/ex_libaio_rw: $(EXDIR)/libaio_rw.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBAIO_LIB)
 	@echo "  [OK] ex_libaio_rw"
+
+# ================= compile_commands.json（给 clangd / IDE 用）=================
+# 用 bear 拦截一次真实编译，把每条编译命令原样记下来 —— 比手写生成器可靠，
+# 因为 Makefile 里的条件宏（如 liburing 版本探测出来的 -DHAVE_SQE_DATA64=1）
+# 只有真跑一遍才知道。
+#
+#   make compdb
+#
+# 依赖 bear：Ubuntu `sudo apt-get install -y bear`；macOS `brew install bear`
+# （macOS 上只能抓到 3 个目标，Linux 侧才完整）
+compdb:
+	@command -v bear >/dev/null 2>&1 || { \
+	  echo "缺少 bear。安装：sudo apt-get install -y bear  /  brew install bear"; exit 1; }
+	@echo ">>> 拦截全量编译（all + examples）"
+	@rm -f compile_commands.json
+	@bear --output compile_commands.json -- $(MAKE) --no-print-directory -B all examples >/dev/null
+	@echo ">>> 追加 libco 与独立探针"
+	@bear --append --output compile_commands.json -- $(MAKE) --no-print-directory -B libco >/dev/null
+	@bear --append --output compile_commands.json -- $(CC) $(CFLAGS) -o /tmp/uring_probe $(ROOT)/scripts/uring_probe.c
+	@python3 -c "import json;d=json.load(open('compile_commands.json'));print('  已生成 compile_commands.json：%d 条' % len(d))"
 
 # ================= 清理 =================
 clean:
