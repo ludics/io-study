@@ -58,6 +58,7 @@ io-study/
 │   ├── html/             三份分析文档（HTML 版，浏览器打开，含图表）
 │   ├── md/               分析文档 + 三篇编程指南 + 结论总结（Markdown 版）
 │   ├── 测量环境与复现.md  每个数字测在什么介质上 + macOS 能测什么（重要，先读这份）
+│   ├── macOS上做Linux性能实验.md  平台选型：真机 / UTM / multipass / 容器 的实测对比
 │   └── 挂载方案对比.md    sshfs（multipass 默认）vs virtiofs 的实测对比与规避办法
 │
 ├── examples/             教学示例（与 docs/md/04~06 三篇编程指南配套，make examples）
@@ -162,7 +163,15 @@ make macos                                 # 编 echo_kqueue / io_macos / bench_
 ./bin/echo_kqueue 19000 &
 ./bin/bench_client 19000 8 256             # C++ 客户端（实测 ~96k QPS）
 bin/io_macos /tmp/t.dat 4096 8192 1 1 256  # F_NOCACHE 磁盘基准
+
+# 也可以「客户端在 Mac、服务端在 Linux 虚拟机里」（跨机器压测）：
+./bin/bench_client --host 192.168.252.3 19000 8 256
 ```
+
+> **平台选型**（想在 macOS 上测 Linux 性能，该用真机 / UTM / multipass / 容器？）
+> 见 **[macOS上做Linux性能实验.md](./docs/macOS上做Linux性能实验.md)**：
+> 实测 VM 的磁盘比宿主 NVMe 慢约 9 倍、宿主负载变化能让同机同代码差 2 倍，
+> 而虚拟网卡只比回环慢约 6%。
 
 `make disk` / `make net` 这类 Linux 目标在 macOS 上会打印一句提示并跳过，不会报一堆头文件错误。
 

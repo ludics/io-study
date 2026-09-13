@@ -1,10 +1,28 @@
+// 多线程 echo 压测客户端（C++，无 GIL）
+//
+// 用法:
+//   ./bench_client [--host <地址>] <端口> [线程数] [消息字节数]
+//
+//     --host   对端地址，默认 127.0.0.1。
+//              跨机器压测时用得上 —— 例如「客户端在 macOS 上、服务端在虚拟机里」：
+//                ./bench_client --host 192.168.252.3 19000 8 256
+//              注意 --host 必须写在最前面（位置参数保持向后兼容）。
+//     端口     必填
+//     线程数   默认 1
+//     消息字节 默认 100
+//
+// 输出: 每秒一行 `QPS: <n>`（行缓冲，被 kill 也不会丢最后几行）
 #include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
 #include <signal.h>
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <thread>
 
@@ -16,6 +34,14 @@
       return ret;                       \
     }                                   \
   } while (0);
+
+// 连接失败时说清楚「连谁失败了、为什么」——
+// 原来只打印 "行号 返回值"（如 "62 -1"），排错时完全看不出是端口没监听还是地址不可达。
+static void die_connect(const char *host, int port) {
+  fprintf(stderr, "连接 %s:%d 失败: %s\n", host, port, strerror(errno));
+  fprintf(stderr, "  排查: 服务端监听了吗（ss -ltn / netstat）？地址可达吗？\n");
+}
+
 
 std::atomic<bool> quit{false};
 std::atomic<int> alive{0};
@@ -36,10 +62,39 @@ int main(int argc, char *argv[]) {
 
   signal(SIGINT, do_quit);
 
-  // 参数：<端口> [线程数] [消息字节数]
-  int port = argc >= 2 ? std::atoi(argv[1]) : 8000;
-  int thread = argc >= 3 ? std::atoi(argv[2]) : 1;
-  int data_size = argc >= 4 ? std::atoi(argv[3]) : 100;
+  // 参数：[--host <地址>] <端口> [线程数] [消息字节数]
+  int argi = 1;
+  std::string host = "127.0.0.1";
+  if (argc >= 3 && std::string(argv[1]) == "--host") {
+    host = argv[2];
+    argi = 3;
+  }
+  if (argc <= argi) {
+    fprintf(stderr, "用法: %s [--host <地址>] <端口> [线程数] [消息字节数]\n", argv[0]);
+    return 1;
+  }
+  int port = std::atoi(argv[argi]);
+  int thread = (argc > argi + 1) ? std::atoi(argv[argi + 1]) : 1;
+  int data_size = (argc > argi + 2) ? std::atoi(argv[argi + 2]) : 100;
+
+  // 先把地址解析出来（用 getaddrinfo，IP 和域名都支持），再开线程 —— 
+  // 避免每个线程各解析一次。
+  struct addrinfo hints;
+  struct addrinfo *res = nullptr;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  char portstr[16];
+  snprintf(portstr, sizeof(portstr), "%d", port);
+  int gerr = getaddrinfo(host.c_str(), portstr, &hints, &res);
+  if (gerr != 0 || !res) {
+    fprintf(stderr, "解析地址 %s:%d 失败: %s\n", host.c_str(), port, gai_strerror(gerr));
+    return 1;
+  }
+  struct sockaddr_in cli_addr;
+  memcpy(&cli_addr, res->ai_addr, sizeof(cli_addr));
+  freeaddrinfo(res);
+  printf("目标: %s:%d  线程=%d  消息=%dB\n", host.c_str(), port, thread, data_size);
   std::string data(data_size, '\0');
   srand(time(0));
   for (char &ch : data) {
@@ -50,16 +105,16 @@ int main(int argc, char *argv[]) {
   for (int i = 0; i < thread; ++i) {
     std::thread([&] {
       ++alive;
-      struct sockaddr_in cli_addr;
       socklen_t cli_len = sizeof(cli_addr);
-      memset(&cli_addr, 0, sizeof(cli_addr));
-      cli_addr.sin_family = AF_INET;
-      cli_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-      cli_addr.sin_port = htons(port);
       std::string buffer(data);
 
       int sock = socket(AF_INET, SOCK_STREAM, 0);
-      ZERO_OR_RETURN(connect(sock, (struct sockaddr *)&cli_addr, cli_len));
+      if (connect(sock, (struct sockaddr *)&cli_addr, cli_len) != 0) {
+        die_connect(host.c_str(), port);
+        close(sock);
+        --alive;
+        return 1;
+      }
       while (!quit) {
         size_t writen = 0;
         while (writen < data.size()) {
