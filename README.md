@@ -212,6 +212,9 @@ Makefile 里的**真实编译参数**（包括 `-DHAVE_SQE_DATA64=1` 这类由�
 VS Code / Cursor 装 **clangd 扩展**即可；用 Remote-SSH 连 Linux 机器时，
 把扩展的 `clangd.path` 指向远端 `/usr/bin/clangd`。
 
+> clangd 会用编辑器打开项目时在根目录建 `.cache/clangd/index/` 存后台索引
+> （`.idx` 文件，纯缓存、可随时重建），已加入 `.gitignore`，不用管它。
+
 > ⚠️ `compile_commands.json` 里是**绝对路径**，在共享挂载目录下只对生成它的那台机器有效
 > （比如 VM 里生成的是 `/home/ubuntu/...`，在 Mac 上打开就解析不了），
 > 所以它**没有提交进仓库**（见 `.gitignore`），换机器重新 `make compdb` 即可。

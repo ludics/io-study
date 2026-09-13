@@ -28,3 +28,8 @@ __pycache__/
 # 内容是**本机绝对路径**（如 /home/ubuntu/workspace/io-study/...），
 # 换机器就失效，所以不提交；用 `make compdb` 重新生成。
 compile_commands.json
+
+# clangd 的后台索引缓存：装完 clangd 后用编辑器打开项目就会在根目录生成
+# .cache/clangd/index/*.idx。按机器与文件哈希生成，纯缓存、可随时重建，不提交。
+# （third_party/libco/.cache 已被上面的 third_party/ 规则覆盖）
+.cache/
