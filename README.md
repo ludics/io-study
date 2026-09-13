@@ -95,7 +95,8 @@ io-study/
 │   ├── check_env.sh          环境体检（内核/依赖/io_uring 可用性）
 │   ├── run_all_bench.sh      一键跑通全部实验
 │   ├── uring_probe.c         io_uring 可用性探针（会翻译 errno）
-│   └── bench_matrix.py       矩阵压测工具（网络 + 磁盘，纯 Python，产出 results/ 报表）
+│   ├── bench_matrix.py       矩阵压测工具（网络 + 磁盘，纯 Python，产出 results/ 报表）
+│   └── vm-clock-guard/      虚拟机时钟校正（NTP 被墙 + 宿主休眠导致 VM 掉时间的兜底）
 │
 └── third_party/          libco 源码 clone 位置（可选，make libco 时用）
 ```
@@ -576,6 +577,13 @@ ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
   另外 `/tmp` **不一定**是磁盘（有的发行版是 tmpfs 内存盘，同步写能测出 163 万 IOPS）。
   现在 `bench_matrix.py` 会自动挑真实本地盘、并在报告里标注介质、对危险介质给强警告。
   完整对照实验见 **[测量环境与复现.md](./docs/测量环境与复现.md)**。
+- **虚拟机时钟会掉（NTP 被墙 + 宿主休眠）**：VM 跑在 QEMU 里，宿主 macOS 一休眠 guest 时钟就停走；
+  本环境还**完全屏蔽了 NTP**（UDP 123 全部超时），chrony 的 `makestep 1 3` 又只允许启动后前 3 次跳跃、
+  之后只能慢速追赶 —— 所以时间越掉越多、怎么修都修不好。实测两台 VM 分别落后 2h13m / 2h05m，
+  每次 `make` 都报 `Clock skew detected`。
+  **解法**：[`scripts/vm-clock-guard/`](./scripts/vm-clock-guard/README.md) 用 HTTPS 的 `Date` 头
+  做时间源，每 5 分钟兜底校正（`sudo bash scripts/vm-clock-guard/install.sh`）。
+  顺带注意：两台 VM 的**时区**原本也不一致（`.2` 是 CST、`.3` 是 UTC），会让时间戳跨机不可比。
 - **多台机器共用一份 `bin/` 会互相覆盖**：工作区挂载进多台 VM 时，`bin/` 是共享的，
   后 `make` 的机器会盖掉先 `make` 的产物（症状：`libaio.so.1t64: cannot open shared object file`）。
   现在 `bin/.build-stamp` 会记下编译主机，`bench_matrix.py` 开跑前核对，不匹配直接拒绝执行。

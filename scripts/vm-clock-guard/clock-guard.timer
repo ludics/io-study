@@ -1,0 +1,13 @@
+[Unit]
+Description=定期校正虚拟机时钟（每 5 分钟检查一次偏差）
+
+[Timer]
+# 开机 30 秒后先来一次（宿主休眠后重启的情况）
+OnBootSec=30s
+# 之后每 5 分钟一次。宿主休眠导致时钟停走时，醒来最多 5 分钟就自动纠正。
+OnUnitActiveSec=5min
+# 不用 Persistent：它依赖磁盘上的时间戳，而时钟本身就是歪的
+Unit=clock-guard.service
+
+[Install]
+WantedBy=timers.target

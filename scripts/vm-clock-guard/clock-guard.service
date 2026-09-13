@@ -1,0 +1,13 @@
+[Unit]
+Description=用 HTTPS Date 头校正虚拟机时钟（网络屏蔽 NTP 时的兜底）
+Documentation=https://github.com/  # 见 scripts/vm-clock-guard/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/clock-guard
+# 需要 root 才能改系统时钟
+User=root
+# 失败了也不要紧（比如临时没网），下一轮再来
+SuccessExitStatus=0 1
