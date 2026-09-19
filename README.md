@@ -96,6 +96,7 @@ io-study/
 │   ├── run_all_bench.sh      一键跑通全部实验
 │   ├── uring_probe.c         io_uring 可用性探针（会翻译 errno）
 │   ├── bench_matrix.py       矩阵压测工具（网络 + 磁盘，纯 Python，产出 results/ 报表）
+│   ├── vm-sync.sh            Mac→VM 同步并构建（rsync 到 VM 本地盘，绕开挂载的所有坑）
 │   └── vm-clock-guard/      虚拟机时钟校正（NTP 被墙 + 宿主休眠导致 VM 掉时间的兜底）
 │
 └── third_party/          libco 源码 clone 位置（可选，make libco 时用）
@@ -627,9 +628,15 @@ ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
     目录遍历快 17x；✅ 无属性缓存（`make` 判断准确）、稀疏文件/符号链接/`fallocate` 完整；
     ❌ **不支持 `mmap`**、**`inotify` 完全不工作**（连 guest 自己改都不触发）。
   - 两者就地编译一个小项目都约是本地盘的 **2 倍**，彼此打平。
-  - 规避：编译用 `make -B`（对 9p 无害、对 sshfs 必需），产物落本地盘
+  - ⚠️ **不要用 `cache=loose` 换性能**：实测快 55~430 倍，但**宿主改动 guest 完全看不到**
+    （编辑完代码，VM 里编译的还是旧内容，且无任何报错）。
+  - ✅ **推荐做法：别在挂载里构建**。用 `bash scripts/vm-sync.sh` 把源码 `rsync` 到 VM 本地盘
+    （实测 95~98 MB/s，比写 9p 挂载快约 4 倍）再编译 —— 元数据、mmap、inotify、稀疏文件全部正常。
+    挂载只当"能在 Mac 上看见 VM 文件"的便利通道。
+  - 兜底纪律：编译用 `make -B`（对 9p 无害、对 sshfs 必需），产物落本地盘
     `make BINDIR=/home/ubuntu/iobin`；需要 mmap/watch 就别用 9p。
-  完整三方实测（含逐个操作的倍数与 `cache=none` 根因）见 **[挂载方案对比.md](./docs/挂载方案对比.md)**。
+  完整三方实测（含逐个操作的倍数、`cache=none` 根因、`sync,dirsync` 的内核来源）见
+  **[挂载方案对比.md](./docs/挂载方案对比.md)**。
 
 ---
 
