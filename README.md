@@ -59,7 +59,7 @@ io-study/
 │   ├── md/               分析文档 + 三篇编程指南 + 结论总结（Markdown 版）
 │   ├── 测量环境与复现.md  每个数字测在什么介质上 + macOS 能测什么（重要，先读这份）
 │   ├── macOS上做Linux性能实验.md  平台选型：真机 / UTM / multipass / 容器 的实测对比
-│   └── 挂载方案对比.md    sshfs（multipass 默认）vs virtiofs 的实测对比与规避办法
+│   └── 挂载方案对比.md    multipass native(9p) / classic(sshfs) / VM 本地盘 三方实测与取舍
 │
 ├── examples/             教学示例（与 docs/md/04~06 三篇编程指南配套，make examples）
 │   ├── epoll_echo.c          epoll 版 echo，教科书式正确（ET 读空 / 循环写 / 非阻塞）
@@ -403,7 +403,7 @@ python3 scripts/bench_matrix.py net --client cpp --secs 3 --mt-workers 4
 | 文档 | 内容概要 |
 | --- | --- |
 | [结论：网络 I/O 与磁盘 I/O 谁快谁慢](./docs/md/07-结论-网络IO与磁盘IO.md) | 8 个实现、两台 VM、十几个维度后的结论；跨网络/磁盘都成立的 5 条第一性原理；选型指南 |
-| [挂载方案对比：sshfs vs virtiofs](./docs/挂载方案对比.md) | multipass 两种挂载的实测差异（元数据差 400 倍）、属性缓存对 `make` 的影响、三种规避方案 |
+| [挂载方案对比：native(9p) / classic(sshfs) / VM 本地盘](./docs/挂载方案对比.md) | 三方同机实测；**`--type native` 其实是 virtio-9p，且比 sshfs 更慢**；页缓存/属性缓存/`mmap`/`inotify` 的取舍；三种规避方案 |
 
 另外还有一份 **[学习路径.md](./docs/学习路径.md)**：写给刚接触 Linux I/O 的人 ——
 三根概念轴、前置知识清单、按顺序的动手实验、延伸阅读、五个常见误区，以及「怎么算学明白了」的自测题。
@@ -592,8 +592,9 @@ ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
 ## 已知限制
 
 - **测量介质会改变结论（最重要的一条）**：磁盘实验的测试文件必须落在**真实本地磁盘**上。
-  放到 sshfs（FUSE over SFTP，本质是网络文件系统）里时，「异步靠深度换吞吐」会**完全反过来** ——
-  实测同一台 VM、同一份代码：本地盘 libaio 是同步的 **23.8x**，sshfs 上只有 **0.61x**；
+  放到挂载目录里时，「异步靠深度换吞吐」会**完全反过来** ——
+  实测同一台 VM、同一份代码：本地盘 libaio 是同步的 **13.0x~23.8x**，
+  **sshfs 上只有 0.61x，9p（native）上只有 1.00x**；
   更阴的是 `O_DIRECT` 在 sshfs 上**打开成功但被忽略**，不报任何错。
   另外 `/tmp` **不一定**是磁盘（有的发行版是 tmpfs 内存盘，同步写能测出 163 万 IOPS）。
   现在 `bench_matrix.py` 会自动挑真实本地盘、并在报告里标注介质、对危险介质给强警告。
@@ -617,12 +618,18 @@ ECHO_SQ_CPU=5 taskset -c 4 ./bin/echo_io_uring_modern 19002
 - **Python 压测端可能先饱和**：`network/bench.py` 是多线程 Python，受 GIL 限制单进程约 1 核到顶，
   会把各服务端的差异压平。矩阵工具的「自动观察」会给出判断；要测服务端上限请换
   `--client cpp`（`bin/bench_client`，C++ 无 GIL）。
-- **工作区挂载（multipass sshfs）的元数据很慢**：在挂载目录里做小文件密集操作（`git status`、
-  大量小文件、文件监听）会明显变慢 —— 实测元数据比 VM 本地盘慢约 400 倍、小文件创建慢 171 倍。
-  更要注意：sshfs 有**约 1 秒的属性缓存**，宿主刚改完文件时 `make` 可能因为 mtime 是旧值而
-  **跳过重编**（文件*内容*读取不受影响）。规避办法：编译用 `make -B`，
-  或把产物落到本地盘 `make BINDIR=/home/ubuntu/iobin`。
-  完整实测与三种方案见 **[挂载方案对比.md](./docs/挂载方案对比.md)**。
+- **挂载方式没有"更快"的选项，只有取舍**（两种都实测过）：
+  - `--type classic`（**sshfs**）：元数据比本地盘慢约 545 倍；⚠️ **约 1 秒属性缓存**，
+    宿主刚改完文件时 `make` 可能因 mtime 是旧值而**跳过重编**；
+    ✅ 支持 `mmap`（clangd/git 需要）、guest 侧改动能触发 `inotify`。
+  - `--type native`：**实测是 virtio-9p，不是 virtiofs，而且更慢** ——
+    元数据比 sshfs 再慢 **2.7x**、大块吞吐只有它的 **1/4**（约 27 MB/s）、
+    目录遍历快 17x；✅ 无属性缓存（`make` 判断准确）、稀疏文件/符号链接/`fallocate` 完整；
+    ❌ **不支持 `mmap`**、**`inotify` 完全不工作**（连 guest 自己改都不触发）。
+  - 两者就地编译一个小项目都约是本地盘的 **2 倍**，彼此打平。
+  - 规避：编译用 `make -B`（对 9p 无害、对 sshfs 必需），产物落本地盘
+    `make BINDIR=/home/ubuntu/iobin`；需要 mmap/watch 就别用 9p。
+  完整三方实测（含逐个操作的倍数与 `cache=none` 根因）见 **[挂载方案对比.md](./docs/挂载方案对比.md)**。
 
 ---
 

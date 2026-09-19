@@ -3,8 +3,13 @@
 > 问题：**想在 macOS 上测 Linux 的 I/O 性能，最推荐哪种方式？multipass 虚拟机好不好？**
 >
 > 短答：**要绝对数字就别在本地测**（用真 Linux 机器）；
-> **要相对对比和内核行为，本地 VM 完全够用**，multipass 能用但有几个具体短板，
-> 其中最该修的是**挂载方式**（sshfs → virtiofs）。
+> **要相对对比和内核行为，本地 VM 完全够用**，multipass 能用但有几个具体短板。
+>
+> ⚠️ **一个我先说错的更正**：我曾推荐「把 sshfs 换成 `--type native`（virtiofs）」，
+> 实测后发现 macOS + QEMU 上那个 `native` 其实是 **virtio-9p，而且比 sshfs 更慢**
+> （元数据再慢 2.7x、大块吞吐只有 1/4）。换挂载**不是**性能优化，
+> 而是"用速度换语义正确性"的取舍 —— 详见
+> [挂载方案对比.md](./挂载方案对比.md)。
 >
 > 本文所有数字都是在本机（Apple Silicon / 12 核 / macOS 14.6）实测的，
 > 不是推断；推断的部分会明确标注「未实测」。
@@ -77,21 +82,38 @@ breakpoint  kprobe  software  tracepoint  uprobe     ← 没有 cpu / armv8_pmuv
 替代方案：软件事件 `perf record -e cpu-clock -F 3000 --call-graph fp`。
 能定位热点函数，但拿不到 IPC / cache miss / 分支预测这类微架构指标。
 
-### 3.3 默认挂载是 sshfs —— **这是最该修的一个**
+### 3.3 挂载方式：classic 是 sshfs，`--type native` 是 **9p**（且更慢）
 
-multipass 的 classic 挂载是 FUSE over SFTP。实测代价：
+**先纠正一个容易搞错的点**：macOS + QEMU 后端上，`multipass mount --type native`
+走的是 **virtio-9p**，不是 virtiofs（换完 `findmnt` 会显示 `9p ... trans=virtio`）。
 
-| 操作 | 相对 VM 本地盘 |
-| --- | --- |
-| 元数据 `stat` | **慢约 400 倍** |
-| 小文件创建 | **慢约 171 倍** |
-| 4KB 随机读 | **慢约 385 倍** |
-| 大块顺序读写 | 慢 10~35 倍（还能忍） |
+两种挂载都没有性能优势，只是短板不同（guest 7.0 上同机同时段实测）：
 
-更糟的两点：**约 1 秒的属性缓存**（宿主改完文件，`make` 可能因 mtime 是旧值而跳过重编），
-以及**如果把磁盘测试文件放在这里，异步 I/O 的结论会完全反过来**
-（实测 `libaio` 只有同步的 **0.61x**；本地盘是 **23.8x**）。
-完整实测见 [测量环境与复现.md](./测量环境与复现.md) 与 [挂载方案对比.md](./挂载方案对比.md)。
+| 操作（相对 VM 本地盘） | native（9p） | classic（sshfs） |
+| --- | --- | --- |
+| 元数据 `stat` | 慢约 **1 484 倍** | 慢约 545 倍 |
+| 小文件创建 | 慢约 290 倍 | 慢约 219 倍 |
+| `open`+`close` | 慢约 **2 335 倍** | 慢约 1 035 倍 |
+| 4KB 随机读 | 慢约 395 倍 | 慢约 283 倍 |
+| 大块顺序读写 | 慢约 **55 倍**（只有 26 MB/s） | 慢约 13 倍（110 MB/s） |
+| 目录遍历（目录项多） | 慢约 17 倍 | 慢约 297 倍 |
+| 就地编译一个小项目 | 本地盘 2 倍 | 本地盘 2 倍 |
+
+**native（9p）在绝大多数项目上比 sshfs 更慢**（`listdir` 是唯一例外）。
+它换来的不是速度，而是：
+
+- ✅ **没有属性缓存** —— 宿主改完文件，guest 立刻看到正确的 `size`/`mtime`
+  （sshfs 有约 1 秒窗口，会让 `make` 跳过重编）；实测宿主以 300ms 间隔连写 10 个版本，
+  9p 下 guest **10 个全部看到且 `stat` 与内容一致**；
+- ✅ POSIX 语义完整（稀疏文件、符号链接、`fallocate` 都可用，sshfs 全都不行）；
+- ❌ 代价：**不支持 `mmap`**（clangd/LSP、git packfile、ripgrep 会受影响）、
+  **`inotify` 完全不工作**（连 guest 自己改都不触发），大块吞吐只有 sshfs 的 1/4。
+
+另外，**两种挂载上都不能跑磁盘 I/O 实验** —— 把测试文件放进去，
+「异步靠深度换吞吐」的结论会完全反过来（本地盘 `libaio` 是同步的 **13.0x**，
+9p 上只有 **1.00x**，sshfs 上 **0.37x**）。
+完整实测见 [挂载方案对比.md](./挂载方案对比.md)，测量介质审计见
+[测量环境与复现.md](./测量环境与复现.md)。
 
 ### 3.4 宿主负载会直接乘到结果上
 
@@ -157,15 +179,21 @@ macOS 上没有 `taskset`。所以在 VM 里无法做"客户端绑 0-3 核、服
 
 按"性价比"排序：
 
-1. **换掉 sshfs 挂载（收益最大）**
+1. **先想清楚挂载要什么，别按名字选**（实测总结见 [挂载方案对比.md](./挂载方案对比.md)）
+   - `--type native` = **virtio-9p，不是 virtiofs，也不更快**：元数据比 sshfs 再慢 2.7x、
+     大块吞吐只有 1/4；换来的是**无属性缓存**（`make` 判断准确）和完整 POSIX 语义，
+     代价是**没有 `mmap`、没有 `inotify`**。
+   - 要 clangd / watch 模式 → 留在 `classic`（sshfs）；要 `make` 判断准确、稀疏文件、
+     符号链接 → 用 `native`。
    ```bash
+   # 想在这两种之间切换（需要停一次实例）
    multipass stop exact-gerbil
-   multipass umount exact-gerbil:/home/ubuntu/workspace      # 若已挂载
-   multipass mount --type native /Users/ludi/workspace exact-gerbil:/home/ubuntu/workspace
+   multipass umount exact-gerbil:/home/ubuntu/workspace
+   multipass mount --type classic /Users/ludi/workspace exact-gerbil:/home/ubuntu/workspace
    multipass start exact-gerbil
    ```
-   `--type native` 走 virtiofs，元数据快得多、没有 1 秒属性缓存、`fallocate` 可用。
-   **注意：需要停一次实例。**
+   - 两者都慢的时候，最稳的是**方案 B**：`rsync` 源码进 VM 本地盘再编译
+     （见 [挂载方案对比.md](./挂载方案对比.md) 第 10 节）。
 2. **磁盘测试文件放 VM 本地盘**（`/var/tmp`），**绝不放挂载目录或 `/tmp`**
    —— `bench_matrix.py` 现在会自动挑路径并在报告里标注介质。
 3. **压测前先看宿主 load**：`uptime` 的第一/第二/第三个数字都应**远小于**核数。
@@ -192,9 +220,15 @@ brew install lima
 limactl start --vm-type=vz --mount-type=virtiofs --cpus=8 --memory=16 template://ubuntu
 ```
 
-**但请对预期保持清醒**：换平台改善的是**干净度、便利性、挂载性能**；
+**但请对预期保持清醒**：换平台改善的是**干净度与便利性**；
 它**不改变**"绝对数字不可信"和"没有 PMU"这两件事 ——
 那是虚拟化的本质，不是 multipass 的实现问题。
+
+> 至于**挂载性能**：UTM/Lima 走的是 Apple Virtualization.framework 的 virtiofs，
+> 与 multipass 在 macOS+QEMU 上的 9p **不是同一套东西**，理论上应该好得多，
+> 但**本项目没有在 UTM/Lima 上实测过**（本文只实测了 multipass 的 9p 与 sshfs）。
+> 如果你换过去，建议用 [挂载方案对比.md](./挂载方案对比.md) 第 2~5 节的方法亲自测一遍，
+> 别按名字假设。
 
 **如何判断你到底需要换**：
 - 只是想验证"我的 epoll/io_uring 代码写得对不对""哪个实现相对更快" → **不用换**，现在的够用。
@@ -207,7 +241,7 @@ limactl start --vm-type=vz --mount-type=virtiofs --cpus=8 --memory=16 template:/
 | 问题 | 回答 |
 | --- | --- |
 | 最推荐的方式？ | **绝对数字 → 真 Linux 机器**；相对对比与内核行为 → 本地 VM 即可 |
-| multipass 好吗？ | **能用，但不理想**。设备层（virtio）没问题，短板是 `cache=write back`、**没有 PMU**、**默认 sshfs 挂载**、无 CPU 亲和性、宿主负载直接乘到结果上 |
-| 最该做的改进？ | **把 sshfs 换成 virtiofs 挂载**（收益最大、成本最低），并确保测试文件落 VM 本地盘 |
+| multipass 好吗？ | **能用，但不理想**。设备层（virtio）没问题，短板是 `cache=write back`、**没有 PMU**、**挂载慢（两种方式都慢，且 native/9p 比 sshfs 更慢）**、无 CPU 亲和性、宿主负载直接乘到结果上 |
+| 最该做的改进？ | **别指望换挂载提升性能** —— 实测 `--type native`（9p）比 sshfs 还慢。真正该做的是**确保测试文件落 VM 本地盘**，以及按需在两种挂载间按语义取舍（见 [挂载方案对比.md](./挂载方案对比.md)） |
 | 虚拟网卡慢吗？ | 实测**只慢约 6%**（小包 ping-pong，噪声内）—— 比想象中好 |
 | 能替代真机吗？ | **不能**。磁盘差约 9 倍，且同机同代码在宿主负载变化下能差 2 倍 |

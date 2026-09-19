@@ -139,7 +139,7 @@ def check_build_stamp(ignore: bool, log=None) -> list[str]:
 
 MEDIUM_KIND_CN = {"local": "本地块设备（可作基准）",
                   "memory": "内存盘（数字无效！）",
-                  "remote": "网络/远程文件系统（异步结论会失效！）",
+                  "remote": "网络/远程文件系统（异步结论会失效！）",  # 含 sshfs 与 9p
                   "unknown": "未知"}
 
 MEDIUM_MEMORY = ("tmpfs", "ramfs", "devtmpfs")
@@ -237,12 +237,19 @@ def medium_warnings(m: dict) -> list[str]:
     elif m["kind"] == "remote":
         out += [
             "⚠️  介质是 %s（网络/远程文件系统）—— 异步 I/O 的结论在这里会失效！" % m["fstype"],
-            "     实测（同一台 VM、同一份代码、同一组参数）：",
-            "       VM 本地盘：同步 8.2k / libaio 195k  →  异步是同步的 23.8x",
-            "       sshfs    ：同步 5.0k / libaio 3.0k  →  异步只有同步的 0.61x",
-            "     更阴的是 O_DIRECT 在这里**打开成功但被忽略**，没有任何报错。",
+            "     实测（同一台 VM、同一份代码、同一组参数，4KB/O_DIRECT/深度 32）：",
+            "       VM 本地盘：同步 7.6k / libaio  98k / io_uring 56k  →  异步是同步的 13.0x / 7.4x",
+            "       sshfs    ：同步 3.2k / libaio 1.2k / io_uring 1.8k →  异步只有同步的 0.37x / 0.57x",
+            "       9p(native)：同步 2.5k / libaio 2.5k / io_uring 1.9k →  异步只有同步的 1.00x / 0.75x",
+            "     更阴的是 O_DIRECT 在 sshfs 上**打开成功但被忽略**，没有任何报错。",
             "     请用 --file 指到真实本地磁盘，否则「深度换吞吐」会被测反。",
         ]
+        if "9p" in m["fstype"].lower():
+            out += [
+                "     补充：multipass 的 --type native 就是这个 9p 挂载（不是 virtiofs）。",
+                "     它另外还有两个会影响工具链的限制：不支持 mmap（clangd/git 受影响）、",
+                "     inotify 完全不工作。详见 docs/挂载方案对比.md。",
+            ]
     return out
 
 
